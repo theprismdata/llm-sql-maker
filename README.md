@@ -21,7 +21,7 @@ MariaDB와 Neo4j를 활용한 지능형 SQL 쿼리 생성 시스템입니다. LL
 
 1. 저장소 클론
 ```bash
-git clone https://github.com/theprismdata/code_llm.git
+git clone https://github.com/theprismdata/llm-sql-maker.git
 cd code_llm
 ```
 
@@ -71,7 +71,7 @@ MariaDB 테이블은 자동으로 생성되며, 다음 테이블들이 포함됩
 2. 코드에서 지원하는 모델 중 하나 설치:
 ```bash
 # 추천 모델 (4GB 메모리 기준)
-ollama pull codellama:7b        # 한글 지원 우수, 빠름
+ollama pull codellama:7b        # 현재 사용중
 # 또는
 ollama pull deepseek-coder:6.7b # 성능 최고
 ```

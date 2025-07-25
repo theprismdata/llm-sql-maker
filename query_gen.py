@@ -1020,7 +1020,7 @@ class HybridQueryGenerator:
         for table_name, schema in self.table_schemas.items():
             table_descriptions[table_name] = {
                 'description': schema.comment,
-                'key_columns': [col['name'] for col in schema.columns[:4]]  # 주요 컬럼 4개만
+                'key_columns': [col['name'] for col in schema.columns]  # 주요 컬럼 4개만
             }
         
         # LLM용 프롬프트 생성
