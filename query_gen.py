@@ -559,86 +559,159 @@ class HybridQueryGenerator:
         return schemas
     
     def extract_table_relations(self) -> List[TableRelation]:
-        """테이블 간 관계 추출"""
+        """실제 데이터베이스 메타데이터와 데이터 분석을 통한 테이블 간 관계 추출"""
         relations = []
         
-        # 1. Foreign Key 관계 추출
-        for table_name, schema in self.table_schemas.items():
-            for fk in schema.foreign_keys:
-                relations.append(TableRelation(
-                    from_table=table_name,
-                    from_column=fk['from_column'],
-                    to_table=fk['to_table'],
-                    to_column=fk['to_column'],
-                    relation_type='foreign_key',
-                    confidence=1.0
-                ))
+        print("🔗 실제 DB 메타데이터에서 테이블 관계 추출 중...")
         
-        # 2. 의미적 관계 추출 (컬럼명 기반)
-        for table1_name, schema1 in self.table_schemas.items():
-            for table2_name, schema2 in self.table_schemas.items():
-                if table1_name != table2_name:
-                    for col1 in schema1.columns:
-                        for col2 in schema2.columns:
-                            # ID 컬럼 매칭 (예: user_id → user_id)
-                            if (col1['name'] == col2['name'] and 
-                                'id' in col1['name'].lower() and 
-                                col1['name'] not in [fk['from_column'] for fk in schema1.foreign_keys]):
-                                
-                                # 이미 FK 관계가 있는지 확인
-                                existing = any(
-                                    r.from_table == table1_name and 
-                                    r.from_column == col1['name'] and
-                                    r.to_table == table2_name and
-                                    r.to_column == col2['name']
-                                    for r in relations
-                                )
-                                
-                                if not existing:
-                                    relations.append(TableRelation(
-                                        from_table=table1_name,
-                                        from_column=col1['name'],
-                                        to_table=table2_name,
-                                        to_column=col2['name'],
-                                        relation_type='semantic',
-                                        confidence=0.8
-                                    ))
+        # 1. 실제 데이터베이스의 Foreign Key 제약조건 조회
+        relations.extend(self._extract_real_foreign_keys())
         
-        # 3. 네이밍 패턴 기반 관계 (예: user_id → users.user_id)
-        for table1_name, schema1 in self.table_schemas.items():
-            for col in schema1.columns:
-                if col['name'].endswith('_id') and col['name'] != f"{table1_name}_id":
-                    # 테이블명 추정
-                    potential_table = col['name'][:-3]  # _id 제거
-                    potential_table_plural = potential_table + 's'
-                    
-                    for table2_name, schema2 in self.table_schemas.items():
-                        if table2_name in [potential_table, potential_table_plural]:
-                            primary_key = next((pk for pk in schema2.primary_keys), None)
-                            if primary_key == col['name']:
-                                # 이미 관계가 있는지 확인
-                                existing = any(
-                                    r.from_table == table1_name and 
-                                    r.from_column == col['name'] and
-                                    r.to_table == table2_name
-                                    for r in relations
-                                )
-                                
-                                if not existing:
-                                    relations.append(TableRelation(
-                                        from_table=table1_name,
-                                        from_column=col['name'],
-                                        to_table=table2_name,
-                                        to_column=primary_key,
-                                        relation_type='naming_pattern',
-                                        confidence=0.7
-                                    ))
+        # 2. 데이터 값 분석 기반 관계 추정 (연결 확인이 가능한 경우)
+        if self.connection:
+            relations.extend(self._extract_data_based_relations())
         
-        self.table_relations = relations
-        print(f"🔗 관계 추출 완료: {len(relations)}개 관계")
-        
+        # 중복 제거
+        unique_relations = []
+        seen = set()
         for rel in relations:
-            print(f"  {rel.from_table}.{rel.from_column} → {rel.to_table}.{rel.to_column} ({rel.relation_type}, {rel.confidence})")
+            key = (rel.from_table, rel.from_column, rel.to_table, rel.to_column)
+            if key not in seen:
+                unique_relations.append(rel)
+                seen.add(key)
+        
+        self.table_relations = unique_relations
+        print(f"🔗 관계 추출 완료: {len(unique_relations)}개 관계")
+        
+        for rel in unique_relations:
+            print(f"  {rel.from_table}.{rel.from_column} → {rel.to_table}.{rel.to_column} ({rel.relation_type}, {rel.confidence:.2f})")
+        
+        return unique_relations
+    
+    def _extract_real_foreign_keys(self) -> List[TableRelation]:
+        """실제 데이터베이스에서 Foreign Key 제약조건 조회"""
+        relations = []
+        
+        if not self.connection:
+            print("⚠️ DB 연결 없음, FK 제약조건 조회 스킵")
+            return relations
+        
+        try:
+            with self.connection.cursor() as cursor:
+                # MariaDB/MySQL에서 FK 제약조건 조회
+                fk_query = """
+                SELECT 
+                    kcu.TABLE_NAME as from_table,
+                    kcu.COLUMN_NAME as from_column,
+                    kcu.REFERENCED_TABLE_NAME as to_table,
+                    kcu.REFERENCED_COLUMN_NAME as to_column,
+                    kcu.CONSTRAINT_NAME as constraint_name
+                FROM information_schema.KEY_COLUMN_USAGE kcu
+                WHERE kcu.TABLE_SCHEMA = %s 
+                  AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+                ORDER BY kcu.TABLE_NAME, kcu.COLUMN_NAME
+                """
+                
+                cursor.execute(fk_query, (self.db_config['database'],))
+                fk_results = cursor.fetchall()
+                
+                for row in fk_results:
+                    from_table, from_column, to_table, to_column, constraint_name = row
+                    relations.append(TableRelation(
+                        from_table=from_table,
+                        from_column=from_column,
+                        to_table=to_table,
+                        to_column=to_column,
+                        relation_type='foreign_key',
+                        confidence=1.0
+                    ))
+                    print(f"🔑 실제 FK 발견: {from_table}.{from_column} → {to_table}.{to_column}")
+                
+        except Exception as e:
+            print(f"⚠️ FK 제약조건 조회 실패: {e}")
+        
+        return relations
+    
+
+    
+    def _extract_data_based_relations(self) -> List[TableRelation]:
+        """실제 데이터 값 분석으로 관계 추정"""
+        relations = []
+        
+        print("📊 데이터 값 분석으로 관계 추정 중...")
+        
+        try:
+            table_names = list(self.table_schemas.keys())
+            
+            with self.connection.cursor() as cursor:
+                for table1_name in table_names:
+                    schema1 = self.table_schemas[table1_name]
+                    
+                    for col1 in schema1.columns:
+                        if 'id' in col1['name'].lower() and col1['name'] != f"{table1_name}_id":
+                            # 이 컬럼의 값들이 다른 테이블의 PK와 일치하는지 확인
+                            
+                            for table2_name in table_names:
+                                if table1_name == table2_name:
+                                    continue
+                                    
+                                schema2 = self.table_schemas[table2_name]
+                                pk_columns = schema2.primary_keys
+                                
+                                if not pk_columns:
+                                    continue
+                                
+                                pk_col = pk_columns[0]  # 첫 번째 PK 사용
+                                
+                                # 실제 데이터 값 비교 (샘플링)
+                                try:
+                                    # table1의 컬럼 값들
+                                    cursor.execute(f"""
+                                        SELECT DISTINCT {col1['name']} 
+                                        FROM {table1_name} 
+                                        WHERE {col1['name']} IS NOT NULL 
+                                        LIMIT 20
+                                    """)
+                                    values1 = [row[0] for row in cursor.fetchall()]
+                                    
+                                    if not values1:
+                                        continue
+                                    
+                                    # table2의 PK 값들
+                                    cursor.execute(f"""
+                                        SELECT DISTINCT {pk_col} 
+                                        FROM {table2_name} 
+                                        WHERE {pk_col} IS NOT NULL 
+                                        LIMIT 50
+                                    """)
+                                    values2 = [row[0] for row in cursor.fetchall()]
+                                    
+                                    if not values2:
+                                        continue
+                                    
+                                    # 교집합 비율 계산
+                                    intersection = set(values1) & set(values2)
+                                    if len(intersection) > 0:
+                                        match_ratio = len(intersection) / len(values1)
+                                        
+                                        if match_ratio > 0.5:  # 50% 이상 일치
+                                            confidence = min(0.9, 0.5 + match_ratio * 0.4)
+                                            relations.append(TableRelation(
+                                                from_table=table1_name,
+                                                from_column=col1['name'],
+                                                to_table=table2_name,
+                                                to_column=pk_col,
+                                                relation_type='data_analysis',
+                                                confidence=confidence
+                                            ))
+                                            print(f"📈 데이터 기반 관계 발견: {table1_name}.{col1['name']} → {table2_name}.{pk_col} (일치율: {match_ratio:.2f})")
+                                
+                                except Exception as e:
+                                    # 개별 테이블 오류는 무시하고 계속
+                                    pass
+                
+        except Exception as e:
+            print(f"⚠️ 데이터 기반 관계 분석 실패: {e}")
         
         return relations
     
@@ -755,7 +828,7 @@ class HybridQueryGenerator:
             # 1단계: 컬럼 분석 기반 강화된 테이블 정보 수집
             print("🧠 컬럼 분석과 LLM을 활용한 지능적 테이블 검색 중...")
             
-            # 모든 테이블과 강화된 메타데이터 가져오기
+            # 모든 테이블과 강화된 메타데이터 가져오기 (컬럼명 + 데이터값 분석 포함)
             enhanced_tables_query = """
             MATCH (t:Table)
             RETURN t.name as table_name, 
@@ -763,39 +836,55 @@ class HybridQueryGenerator:
                    coalesce(t.estimated_role, '') as estimated_role,
                    coalesce(t.table_type, '') as table_type,
                    coalesce(t.business_purpose, '') as business_purpose,
-                   coalesce(t.confidence_score, 0.0) as confidence_score
+                   coalesce(t.confidence_score, 0.0) as confidence_score,
+                   coalesce(t.data_estimated_role, '') as data_estimated_role,
+                   coalesce(t.data_confidence_score, 0.0) as data_confidence_score,
+                   coalesce(t.enhanced_comment, t.comment) as enhanced_comment,
+                   coalesce(t.total_rows, 0) as total_rows
             ORDER BY t.name
             """
             
             all_tables = session.run(enhanced_tables_query)
             table_info = []
             for record in all_tables:
-                # 컬럼 분석 정보가 없으면 실시간으로 분석
+                # 분석 정보 통합 (컬럼명 분석 + 데이터값 분석)
                 table_name = record['table_name']
                 estimated_role = record['estimated_role']
+                data_estimated_role = record['data_estimated_role']
+                enhanced_comment = record['enhanced_comment']
+                total_rows = record['total_rows']
                 
-                if not estimated_role and table_name in self.table_schemas:
-                    print(f"🔍 {table_name} 테이블 실시간 컬럼 분석...")
-                    analysis = self.analyze_table_role_from_columns(table_name)
-                    estimated_role = analysis.get('estimated_role', '')
-                    business_purpose = analysis.get('business_purpose', record['comment'])
-                else:
-                    business_purpose = record['business_purpose'] or record['comment']
+                # 최종 역할과 설명 결정
+                final_role = ""
+                final_description = enhanced_comment or record['comment']
+                
+                if data_estimated_role and record['data_confidence_score'] > 0.3:
+                    # 데이터 분석 결과가 신뢰도가 높으면 우선 사용
+                    final_role = data_estimated_role
+                    if estimated_role and estimated_role != data_estimated_role:
+                        final_role += f" (컬럼분석: {estimated_role})"
+                elif estimated_role:
+                    # 컬럼명 분석 결과 사용
+                    final_role = estimated_role
+                
+                business_purpose = record['business_purpose'] or final_description
                 
                 table_info.append({
                     'name': table_name,
-                    'description': record['comment'],
-                    'estimated_role': estimated_role,
+                    'description': final_description,
+                    'estimated_role': final_role,
                     'table_type': record['table_type'],
                     'business_purpose': business_purpose,
-                    'confidence_score': record['confidence_score']
+                    'confidence_score': max(record['confidence_score'], record['data_confidence_score']),
+                    'total_rows': total_rows
                 })
             
             # LLM에게 강화된 메타데이터로 의미적 분석 요청
             table_descriptions = "\n".join([
                 f"- {table['name']}: {table['description']}"
                 + (f" [추정역할: {table['estimated_role']}]" if table['estimated_role'] else "")
-                + (f" [비즈니스목적: {table['business_purpose']}]" if table['business_purpose'] != table['description'] else "")
+                + (f" [레코드수: {table['total_rows']}개]" if table['total_rows'] > 0 else "")
+                + (f" [신뢰도: {table['confidence_score']:.2f}]" if table['confidence_score'] > 0 else "")
                 for table in table_info
             ])
             
@@ -1103,6 +1192,247 @@ JSON:"""
                     print(f"✅ {table_name} 메타데이터 업데이트 완료")
         
         print("🎉 모든 테이블 메타데이터 강화 완료!")
+    
+    def analyze_table_role_from_data_values(self, table_name: str) -> Dict[str, Any]:
+        """실제 컬럼 값(데이터)을 분석하여 테이블의 역할과 성격 추정"""
+        if not self.connection or table_name not in self.table_schemas:
+            return {}
+        
+        print(f"🔍 '{table_name}' 테이블의 실제 데이터 값 분석 중...")
+        
+        analysis = {
+            'table_name': table_name,
+            'data_patterns': [],
+            'estimated_role': '',
+            'data_characteristics': {},
+            'confidence_score': 0.0,
+            'sample_insights': []
+        }
+        
+        try:
+            with self.connection.cursor() as cursor:
+                # 1. 기본 통계 정보 수집
+                cursor.execute(f"SELECT COUNT(*) as total_rows FROM {table_name}")
+                total_rows = cursor.fetchone()[0]
+                
+                if total_rows == 0:
+                    analysis['estimated_role'] = "빈 테이블 - 데이터 없음"
+                    return analysis
+                
+                analysis['data_characteristics']['total_rows'] = total_rows
+                print(f"📊 총 레코드 수: {total_rows}")
+                
+                # 2. 샘플 데이터로 패턴 분석
+                schema = self.table_schemas[table_name]
+                sample_size = min(100, total_rows)  # 최대 100개 샘플
+                
+                cursor.execute(f"SELECT * FROM {table_name} LIMIT {sample_size}")
+                sample_data = cursor.fetchall()
+                
+                if not sample_data:
+                    return analysis
+                
+                # 컬럼별 데이터 패턴 분석
+                columns = schema.columns
+                insights = []
+                
+                for i, column in enumerate(columns):
+                    col_name = column['name']
+                    col_values = [row[i] for row in sample_data if row[i] is not None]
+                    
+                    if not col_values:
+                        continue
+                    
+                    col_analysis = self._analyze_column_values(col_name, col_values, total_rows)
+                    if col_analysis:
+                        insights.append(col_analysis)
+                
+                analysis['sample_insights'] = insights
+                
+                # 3. 테이블 역할 추정
+                role_estimation = self._estimate_table_role_from_data_patterns(insights, total_rows)
+                analysis.update(role_estimation)
+                
+                print(f"📈 데이터 기반 분석 결과:")
+                print(f"  - 추정 역할: {analysis['estimated_role']}")
+                print(f"  - 신뢰도: {analysis['confidence_score']:.2f}")
+                for insight in insights[:3]:  # 상위 3개만 출력
+                    print(f"  - {insight}")
+                
+        except Exception as e:
+            print(f"❌ 데이터 분석 중 오류: {e}")
+            analysis['estimated_role'] = "분석 실패"
+        
+        return analysis
+    
+    def _analyze_column_values(self, col_name: str, values: list, total_rows: int) -> str:
+        """개별 컬럼의 값들을 분석하여 패턴 파악"""
+        if not values:
+            return ""
+        
+        unique_count = len(set(values))
+        sample_count = len(values)
+        
+        # 유니크 비율 계산
+        uniqueness_ratio = unique_count / sample_count
+        
+        # 값 타입 분석
+        value_types = set(type(v).__name__ for v in values)
+        
+        insights = []
+        
+        # 1. ID 패턴 분석
+        if 'id' in col_name.lower():
+            if uniqueness_ratio > 0.95:
+                insights.append(f"{col_name}: 고유 식별자 (유니크율 {uniqueness_ratio:.2f})")
+            elif uniqueness_ratio < 0.3:
+                insights.append(f"{col_name}: 외래키/참조키 (중복율 높음)")
+        
+        # 2. 이름/텍스트 패턴 분석
+        if any(keyword in col_name.lower() for keyword in ['name', 'title', 'description']):
+            if 'str' in value_types:
+                avg_length = sum(len(str(v)) for v in values) / len(values)
+                if avg_length > 50:
+                    insights.append(f"{col_name}: 상세 설명 텍스트 (평균 {avg_length:.0f}자)")
+                else:
+                    insights.append(f"{col_name}: 짧은 이름/제목 (평균 {avg_length:.0f}자)")
+        
+        # 3. 숫자 패턴 분석
+        if any(t in value_types for t in ['int', 'float', 'Decimal']):
+            numeric_values = [float(v) for v in values if isinstance(v, (int, float)) or (hasattr(v, '__float__'))]
+            if numeric_values:
+                min_val, max_val = min(numeric_values), max(numeric_values)
+                avg_val = sum(numeric_values) / len(numeric_values)
+                
+                if 'price' in col_name.lower() or 'amount' in col_name.lower():
+                    insights.append(f"{col_name}: 금액 데이터 (평균 {avg_val:,.0f}, 범위 {min_val:,.0f}~{max_val:,.0f})")
+                elif 'quantity' in col_name.lower() or 'count' in col_name.lower():
+                    insights.append(f"{col_name}: 수량 데이터 (평균 {avg_val:.1f}, 범위 {min_val}~{max_val})")
+                elif max_val <= 5 and min_val >= 1:
+                    insights.append(f"{col_name}: 평점/등급 데이터 (1~5 범위)")
+        
+        # 4. 상태/카테고리 패턴 분석
+        if uniqueness_ratio < 0.2 and 'str' in value_types:
+            common_values = list(set(values))[:5]
+            insights.append(f"{col_name}: 카테고리/상태 데이터 (값: {common_values})")
+        
+        # 5. 날짜/시간 패턴 분석
+        if any(keyword in col_name.lower() for keyword in ['date', 'time', 'created', 'updated']):
+            insights.append(f"{col_name}: 시간 추적 데이터 (시계열)")
+        
+        return " | ".join(insights) if insights else ""
+    
+    def _estimate_table_role_from_data_patterns(self, insights: list, total_rows: int) -> Dict[str, Any]:
+        """데이터 패턴을 종합하여 테이블 역할 추정"""
+        insight_text = " ".join(insights).lower()
+        
+        role_scores = {
+            'master_data': 0,
+            'transaction': 0,
+            'lookup_table': 0,
+            'log_table': 0,
+            'relation_table': 0
+        }
+        
+        # 마스터 데이터 패턴
+        if any(keyword in insight_text for keyword in ['고유 식별자', '이름', '설명', '상세']):
+            role_scores['master_data'] += 2
+        
+        # 트랜잭션 패턴
+        if any(keyword in insight_text for keyword in ['금액', '수량', '시간 추적']):
+            role_scores['transaction'] += 3
+        
+        # 룩업/코드 테이블 패턴
+        if '카테고리/상태' in insight_text and total_rows < 100:
+            role_scores['lookup_table'] += 3
+        
+        # 로그 테이블 패턴
+        if total_rows > 1000 and '시간 추적' in insight_text:
+            role_scores['log_table'] += 2
+        
+        # 관계 테이블 패턴
+        if insight_text.count('외래키') >= 2:
+            role_scores['relation_table'] += 3
+        
+        # 최고 점수 역할 선택
+        if max(role_scores.values()) > 0:
+            best_role = max(role_scores.items(), key=lambda x: x[1])
+            role_name, score = best_role
+            
+            role_mapping = {
+                'master_data': '마스터 데이터 테이블 - 기준 정보 저장',
+                'transaction': '트랜잭션 테이블 - 업무 거래 데이터',
+                'lookup_table': '룩업 테이블 - 코드/카테고리 관리',
+                'log_table': '로그 테이블 - 이벤트/활동 기록',
+                'relation_table': '관계 테이블 - 테이블 간 연결'
+            }
+            
+            return {
+                'estimated_role': role_mapping[role_name],
+                'confidence_score': min(score / 5.0, 1.0),  # 0~1 범위로 정규화
+                'data_patterns': [role_name]
+            }
+        else:
+            return {
+                'estimated_role': '일반 데이터 테이블',
+                'confidence_score': 0.1,
+                'data_patterns': ['general']
+            }
+    
+    def enrich_metadata_with_data_analysis(self):
+        """테이블 설명이 부족한 경우에만 실제 데이터 값 분석 결과를 Neo4j에 추가"""
+        if not self.neo4j_driver or not self.connection:
+            print("❌ Neo4j와 MariaDB 연결이 모두 필요합니다.")
+            return
+        
+        print("🔄 설명 부족 테이블의 실제 데이터 값 분석으로 메타데이터 강화 중...")
+        
+        with self.neo4j_driver.session() as session:
+            for table_name in self.table_schemas.keys():
+                schema = self.table_schemas[table_name]
+                table_comment = schema.comment
+                
+                # 테이블 설명이 없거나 너무 짧은 경우에만 데이터 값 분석 수행
+                should_analyze = (
+                    not table_comment or 
+                    len(table_comment.strip()) < 10 or
+                    table_comment.strip() == table_name or
+                    "테이블" in table_comment and len(table_comment) < 20
+                )
+                
+                if should_analyze:
+                    print(f"\n📊 {table_name} 테이블 - 설명 부족으로 데이터 값 분석 수행...")
+                    print(f"   현재 설명: '{table_comment}'")
+                    
+                    # 데이터 값 분석 수행
+                    data_analysis = self.analyze_table_role_from_data_values(table_name)
+                    
+                    if data_analysis and data_analysis.get('estimated_role'):
+                        # Neo4j에 데이터 분석 결과 추가
+                        update_query = """
+                        MATCH (t:Table {name: $table_name})
+                        SET t.data_estimated_role = $data_estimated_role,
+                            t.data_confidence_score = $data_confidence_score,
+                            t.data_patterns = $data_patterns,
+                            t.total_rows = $total_rows,
+                            t.enhanced_comment = coalesce(t.comment, '') + ' [데이터분석: ' + $data_estimated_role + ']'
+                        RETURN t
+                        """
+                        
+                        session.run(update_query,
+                            table_name=table_name,
+                            data_estimated_role=data_analysis['estimated_role'],
+                            data_confidence_score=data_analysis['confidence_score'],
+                            data_patterns=data_analysis['data_patterns'],
+                            total_rows=data_analysis['data_characteristics'].get('total_rows', 0)
+                        )
+                        
+                        print(f"✅ {table_name} 데이터 분석 결과 저장 완료")
+                else:
+                    print(f"⏭️  {table_name} 테이블 - 충분한 설명 존재, 데이터 분석 스킵")
+                    print(f"   현재 설명: '{table_comment}'")
+        
+        print("🎉 설명 부족 테이블들의 실제 데이터 분석 완료!")
     
     def find_optimal_join_sequence(self, required_tables: List[str]) -> List[Dict]:
         """필요한 테이블들을 조인하는 최적 순서 찾기"""
@@ -1616,7 +1946,10 @@ SQL 쿼리:"""
             
             # 컬럼 분석 기반 메타데이터 강화
             self.enrich_table_metadata_with_column_analysis()
-            print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 + 컬럼 기반 역할 추정 사용)")
+            
+            # 실제 데이터 값 분석 기반 메타데이터 강화 (설명이 부족한 테이블만)
+            self.enrich_metadata_with_data_analysis()
+            print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 + 컬럼명/데이터값 기반 역할 추정 사용)")
         else:
             print("⚠️  기본 모드로 실행 (Neo4j 없이)")
         
