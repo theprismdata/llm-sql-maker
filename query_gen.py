@@ -752,27 +752,50 @@ class HybridQueryGenerator:
         print("🔍 Neo4j 그래프 메타 정보로 의미적 테이블 검색 중...")
         
         with self.neo4j_driver.session() as session:
-            # 1단계: LLM을 활용한 의미적 테이블 검색
-            print("🧠 LLM이 사용자 요청을 분석하여 관련 테이블을 찾는 중...")
+            # 1단계: 컬럼 분석 기반 강화된 테이블 정보 수집
+            print("🧠 컬럼 분석과 LLM을 활용한 지능적 테이블 검색 중...")
             
-            # 모든 테이블과 설명 정보 가져오기
-            all_tables_query = """
+            # 모든 테이블과 강화된 메타데이터 가져오기
+            enhanced_tables_query = """
             MATCH (t:Table)
-            RETURN t.name as table_name, t.comment as comment
+            RETURN t.name as table_name, 
+                   t.comment as comment,
+                   coalesce(t.estimated_role, '') as estimated_role,
+                   coalesce(t.table_type, '') as table_type,
+                   coalesce(t.business_purpose, '') as business_purpose,
+                   coalesce(t.confidence_score, 0.0) as confidence_score
             ORDER BY t.name
             """
             
-            all_tables = session.run(all_tables_query)
+            all_tables = session.run(enhanced_tables_query)
             table_info = []
             for record in all_tables:
+                # 컬럼 분석 정보가 없으면 실시간으로 분석
+                table_name = record['table_name']
+                estimated_role = record['estimated_role']
+                
+                if not estimated_role and table_name in self.table_schemas:
+                    print(f"🔍 {table_name} 테이블 실시간 컬럼 분석...")
+                    analysis = self.analyze_table_role_from_columns(table_name)
+                    estimated_role = analysis.get('estimated_role', '')
+                    business_purpose = analysis.get('business_purpose', record['comment'])
+                else:
+                    business_purpose = record['business_purpose'] or record['comment']
+                
                 table_info.append({
-                    'name': record['table_name'],
-                    'description': record['comment']
+                    'name': table_name,
+                    'description': record['comment'],
+                    'estimated_role': estimated_role,
+                    'table_type': record['table_type'],
+                    'business_purpose': business_purpose,
+                    'confidence_score': record['confidence_score']
                 })
             
-            # LLM에게 의미적 분석 요청
+            # LLM에게 강화된 메타데이터로 의미적 분석 요청
             table_descriptions = "\n".join([
-                f"- {table['name']}: {table['description']}" 
+                f"- {table['name']}: {table['description']}"
+                + (f" [추정역할: {table['estimated_role']}]" if table['estimated_role'] else "")
+                + (f" [비즈니스목적: {table['business_purpose']}]" if table['business_purpose'] != table['description'] else "")
                 for table in table_info
             ])
             
@@ -893,6 +916,193 @@ JSON:"""
             
             print(f"✅ 최종 선택된 테이블: {final_tables}")
             return final_tables[:6]  # 최대 6개 테이블로 제한
+    
+    def analyze_table_role_from_columns(self, table_name: str) -> Dict[str, Any]:
+        """컬럼 정보를 분석하여 테이블의 역할과 의미 추정"""
+        if not self.neo4j_driver or table_name not in self.table_schemas:
+            return {}
+        
+        schema = self.table_schemas[table_name]
+        columns = schema.columns
+        
+        analysis = {
+            'table_name': table_name,
+            'estimated_role': '',
+            'table_type': '',
+            'business_purpose': '',
+            'column_patterns': [],
+            'confidence_score': 0.0
+        }
+        
+        # 컬럼명 패턴 분석
+        column_names = [col['name'].lower() for col in columns]
+        column_types = [col['type'].upper() for col in columns]
+        
+        print(f"🔍 '{table_name}' 테이블 컬럼 분석 중...")
+        print(f"📋 컬럼들: {column_names}")
+        
+        # 1. 기본 테이블 타입 분류
+        confidence_scores = {}
+        
+        # 마스터 데이터 테이블 패턴
+        master_patterns = [
+            (['name', 'title', 'description'], '마스터 데이터'),
+            (['category', 'type', 'status'], '분류/카테고리'),
+            (['code', 'value', 'display'], '코드 테이블'),
+            (['config', 'setting', 'param'], '설정 테이블')
+        ]
+        
+        # 트랜잭션 테이블 패턴
+        transaction_patterns = [
+            (['order', 'purchase', 'payment'], '주문/거래'),
+            (['amount', 'price', 'total', 'quantity'], '거래 상세'),
+            (['date', 'time', 'created_at', 'updated_at'], '시계열 데이터'),
+            (['from', 'to', 'source', 'target'], '이동/전송 데이터')
+        ]
+        
+        # 관계 테이블 패턴
+        relation_patterns = [
+            (['_id', 'id'], '연결 테이블'),
+            (['mapping', 'link', 'ref'], '매핑 테이블'),
+            (['item', 'detail', 'line'], '상세 테이블')
+        ]
+        
+        # 로그/이벤트 테이블 패턴
+        log_patterns = [
+            (['log', 'event', 'history'], '로그/이벤트'),
+            (['audit', 'trace', 'track'], '감사/추적'),
+            (['session', 'visit', 'click'], '사용자 행동')
+        ]
+        
+        # 패턴 매칭 점수 계산
+        def calculate_pattern_score(patterns, category_name):
+            max_score = 0
+            matched_pattern = []
+            
+            for pattern_keywords, description in patterns:
+                score = 0
+                matches = []
+                
+                for keyword in pattern_keywords:
+                    for col_name in column_names:
+                        if keyword in col_name:
+                            score += 1
+                            matches.append(f"{col_name}({keyword})")
+                
+                if score > max_score:
+                    max_score = score
+                    matched_pattern = [description, matches]
+            
+            if max_score > 0:
+                confidence_scores[category_name] = (max_score / len(column_names), matched_pattern)
+            
+            return max_score
+        
+        # 각 패턴별 점수 계산
+        master_score = calculate_pattern_score(master_patterns, 'master')
+        transaction_score = calculate_pattern_score(transaction_patterns, 'transaction')
+        relation_score = calculate_pattern_score(relation_patterns, 'relation')
+        log_score = calculate_pattern_score(log_patterns, 'log')
+        
+        # 2. 특수 컬럼 패턴 분석
+        special_patterns = []
+        
+        # ID 컬럼 분석
+        id_columns = [col for col in column_names if 'id' in col]
+        if len(id_columns) > 2:
+            special_patterns.append(f"다중 ID 컬럼 ({len(id_columns)}개) - 관계형 테이블")
+        
+        # 시간 컬럼 분석
+        time_columns = [col for col in column_names if any(keyword in col for keyword in ['date', 'time', 'created', 'updated', 'modified'])]
+        if time_columns:
+            special_patterns.append(f"시간 추적 컬럼 - 이벤트/로그성 테이블")
+        
+        # 금액/수량 컬럼 분석
+        money_columns = [col for col in column_names if any(keyword in col for keyword in ['amount', 'price', 'cost', 'total', 'quantity', 'count'])]
+        if money_columns:
+            special_patterns.append(f"금액/수량 컬럼 - 거래/주문 테이블")
+        
+        # 상태 컬럼 분석
+        status_columns = [col for col in column_names if any(keyword in col for keyword in ['status', 'state', 'flag', 'active'])]
+        if status_columns:
+            special_patterns.append(f"상태 관리 컬럼 - 워크플로우 테이블")
+        
+        # 3. 최종 역할 추정
+        if confidence_scores:
+            # 가장 높은 점수의 카테고리 선택
+            best_category = max(confidence_scores.items(), key=lambda x: x[1][0])
+            category_name = best_category[0]
+            score, (description, matches) = best_category[1]
+            
+            analysis['table_type'] = category_name
+            analysis['estimated_role'] = description
+            analysis['confidence_score'] = score
+            analysis['column_patterns'] = special_patterns
+            
+            # 비즈니스 목적 추정
+            if category_name == 'master':
+                analysis['business_purpose'] = f"기준 정보 관리 - {table_name}의 마스터 데이터 저장"
+            elif category_name == 'transaction':
+                analysis['business_purpose'] = f"거래 데이터 처리 - {table_name} 관련 트랜잭션 기록"
+            elif category_name == 'relation':
+                analysis['business_purpose'] = f"데이터 연결 - 다른 테이블들 간의 관계 정의"
+            elif category_name == 'log':
+                analysis['business_purpose'] = f"이벤트 추적 - {table_name} 관련 활동 로그"
+            
+            print(f"📊 분석 결과:")
+            print(f"  - 테이블 타입: {category_name}")
+            print(f"  - 추정 역할: {description}")
+            print(f"  - 신뢰도: {score:.2f}")
+            print(f"  - 매칭 패턴: {matches}")
+            print(f"  - 특수 패턴: {special_patterns}")
+            print(f"  - 비즈니스 목적: {analysis['business_purpose']}")
+        else:
+            analysis['estimated_role'] = "일반 데이터 테이블"
+            analysis['table_type'] = "general"
+            analysis['business_purpose'] = f"{table_name} 관련 정보 저장"
+            analysis['column_patterns'] = special_patterns
+            
+            print(f"📊 분석 결과: 특별한 패턴이 발견되지 않음 - 일반 테이블")
+        
+        return analysis
+    
+    def enrich_table_metadata_with_column_analysis(self):
+        """모든 테이블의 컬럼 분석 결과를 Neo4j에 추가"""
+        if not self.neo4j_driver:
+            print("❌ Neo4j 연결이 필요합니다.")
+            return
+        
+        print("🔄 컬럼 분석 기반 테이블 메타데이터 강화 중...")
+        
+        with self.neo4j_driver.session() as session:
+            for table_name in self.table_schemas.keys():
+                # 컬럼 분석 수행
+                analysis = self.analyze_table_role_from_columns(table_name)
+                
+                if analysis:
+                    # Neo4j에 분석 결과 업데이트
+                    update_query = """
+                    MATCH (t:Table {name: $table_name})
+                    SET t.estimated_role = $estimated_role,
+                        t.table_type = $table_type,
+                        t.business_purpose = $business_purpose,
+                        t.confidence_score = $confidence_score,
+                        t.column_patterns = $column_patterns
+                    RETURN t
+                    """
+                    
+                    session.run(update_query,
+                        table_name=table_name,
+                        estimated_role=analysis['estimated_role'],
+                        table_type=analysis['table_type'],
+                        business_purpose=analysis['business_purpose'],
+                        confidence_score=analysis['confidence_score'],
+                        column_patterns=analysis['column_patterns']
+                    )
+                    
+                    print(f"✅ {table_name} 메타데이터 업데이트 완료")
+        
+        print("🎉 모든 테이블 메타데이터 강화 완료!")
     
     def find_optimal_join_sequence(self, required_tables: List[str]) -> List[Dict]:
         """필요한 테이블들을 조인하는 최적 순서 찾기"""
@@ -1403,7 +1613,10 @@ SQL 쿼리:"""
             self.extract_schema_from_ddl()
             self.extract_table_relations()
             self.create_schema_graph_in_neo4j()
-            print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 사용)")
+            
+            # 컬럼 분석 기반 메타데이터 강화
+            self.enrich_table_metadata_with_column_analysis()
+            print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 + 컬럼 기반 역할 추정 사용)")
         else:
             print("⚠️  기본 모드로 실행 (Neo4j 없이)")
         
