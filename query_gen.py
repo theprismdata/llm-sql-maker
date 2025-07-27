@@ -1495,13 +1495,11 @@ JSON:"""
     
     def find_target_tables(self, user_request: str) -> List[str]:
         """단계 1: CodeLlama를 사용하여 Neo4j에서 대상 테이블 검색"""
-        prompt = f"""다음 요청에 필요한 테이블들을 Neo4j에서 검색해주세요:
+        prompt = f"""사용자 요청: {user_request}
 
-사용자 요청: {user_request}
+중요: 아래 JSON 형식으로만 응답하세요. 설명이나 추가 텍스트를 포함하지 마세요.
 
-Neo4j에서 테이블 관계와 설명을 검색하여, 이 요청을 처리하는데 필요한 테이블들을 찾아주세요.
-응답은 JSON 형식으로 반환해주세요:
-{{"tables": ["table1", "table2"], "reason": "선택 이유"}}"""
+{{"tables": ["필요한테이블1", "필요한테이블2"], "reason": "선택 이유"}}"""
 
         response = self.call_llm(prompt, stage="table_search")
         if not response:
@@ -1509,10 +1507,21 @@ Neo4j에서 테이블 관계와 설명을 검색하여, 이 요청을 처리하�
         
         try:
             import json
-            result = json.loads(response)
-            return result.get('tables', [])
-        except:
-            return []
+            # JSON 블록 추출
+            response_clean = response.strip()
+            json_start = response_clean.find('{')
+            json_end = response_clean.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                json_str = response_clean[json_start:json_end]
+                result = json.loads(json_str)
+                print(f"🔍 선택된 테이블: {result.get('tables', [])}")
+                print(f"📝 선택 이유: {result.get('reason', '')}")
+                return result.get('tables', [])
+        except Exception as e:
+            print(f"⚠️ JSON 파싱 실패: {e}")
+            print(f"💡 원본 응답:\n{response}")
+        return []
     
     def find_target_columns(self, user_request: str, tables: List[str]) -> Dict[str, List[str]]:
         """단계 2: CodeLlama를 사용하여 Neo4j에서 필요한 컬럼 검색"""
@@ -1532,7 +1541,13 @@ Neo4j에서 테이블 관계와 설명을 검색하여, 이 요청을 처리하�
         
         try:
             import json
-            result = json.loads(response)
+            response_clean = response.strip()
+            json_start = response_clean.find('{')
+            json_end = response_clean.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                json_str = response_clean[json_start:json_end]
+                result = json.loads(json_str)
             return result.get('columns', {})
         except:
             return {}
