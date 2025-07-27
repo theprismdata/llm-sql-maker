@@ -121,8 +121,15 @@ class TableRelation:
     from_column: str
     to_table: str
     to_column: str
-    relation_type: str  # 'foreign_key', 'semantic', 'naming_pattern'
+    relation_type: str  # 'foreign_key', 'semantic', 'naming_pattern', 'description_semantic'
     confidence: float   # 관계의 확신도 (0.0 ~ 1.0)
+    # 컬럼 메타데이터 추가
+    from_column_type: str = ""     # 컬럼 타입 (예: INT, VARCHAR, etc.)
+    to_column_type: str = ""       # 컬럼 타입
+    from_column_desc: str = ""     # 컬럼 설명/코멘트
+    to_column_desc: str = ""       # 컬럼 설명/코멘트
+    is_nullable: bool = True       # NULL 허용 여부
+    is_indexed: bool = False       # 인덱스 여부
 
 @dataclass
 class TableSchema:
@@ -152,26 +159,24 @@ class HybridQueryGenerator:
             'password': 'password123'
         }
         
-        # LLM 모델 설정
+                # LLM 모델 설정
         # =================================================================
         
-        # 사용할 LLM 모델 선택 (원하는 모델 선택)
-        LLM_MODEL = "ollama"  # "claude" 또는 "ollama" 선택
+        # 1. 초기 구성용 Claude 설정 (테이블 관계 분석)
+        self.init_llm_type = "claude"
+        self.claude_model = "claude-sonnet-4-20250514"  # 최신 Claude 모델
+        self.claude_api_key = os.getenv('ANTHROPIC_API_KEY', "")  # 환경변수에서 API 키 읽기
+        if not self.claude_api_key:
+            print("⚠️ ANTHROPIC_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요.")
+            self.init_llm_type = "ollama"  # Claude API 키가 없으면 OLLAMA로 폴백
         
-        if LLM_MODEL == "claude":
-            self.llm_type = "claude"
-            self.claude_model = "claude-3-sonnet-20240229"  # 최신 Claude 모델
-            self.claude_api_key = os.getenv('ANTHROPIC_API_KEY', "")  # 환경변수에서 API 키 읽기
-        else:
-            self.llm_type = "ollama"
-            self.ollama_url = "http://localhost:11434"
-            # 사용 가능한 OLLAMA 모델들:
-            # - codellama:7b       : 4GB 메모리에 적합하고 한글 지원 우수 (빠름)
-            # - deepseek-coder:6.7b: 성능 최고, 한글 지원 우수
-            # - deepseek-coder:1.3b: 메모리 절약, 한글 지원 우수
-            # - sqlcoder:7b        : SQL 특화, 영어 위주
-            self.model_name = "codellama:7b"
-
+        # 2. 쿼리 생성용 CodeLlama 설정
+        self.query_llm_type = "ollama"
+        self.ollama_url = "http://localhost:11434"
+        self.codellama_model = "codellama:7b"  # 쿼리 생성에 사용할 모델
+        
+        # 현재 사용 중인 LLM 설정 (초기화는 Claude, 쿼리 생성은 CodeLlama)
+        self.current_llm = self.init_llm_type  # 시작은 초기화 모드
         
         self.connection = None
         self.neo4j_driver = None
@@ -179,26 +184,37 @@ class HybridQueryGenerator:
         self.table_schemas = {}
         self.table_relations = []
         
-        # Claude 클라이언트 초기화
-        if self.llm_type == "claude":
+        # LLM 클라이언트 초기화
+        # 1. Claude 초기화 시도 (초기 분석용)
+        if self.init_llm_type == "claude":
             if not ANTHROPIC_AVAILABLE:
                 print("❌ anthropic 라이브러리가 설치되지 않았습니다.")
                 print("💡 설치 명령: pip install anthropic")
-                self.llm_type = "ollama"  # 폴백
-            elif not hasattr(self, 'claude_api_key') or not self.claude_api_key:
-                print("⚠️  ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
+                self.init_llm_type = "ollama"  # 폴백
+            elif not self.claude_api_key:
+                print("⚠️  ANTHROPIC_API_KEY가 설정되지 않았습니다.")
                 print("💡 다음 중 하나를 선택하세요:")
-                print("   1. 환경변수 설정: export ANTHROPIC_API_KEY='your-key'")
-                print("   2. 코드에서 직접 설정: self.claude_api_key = 'your-key'")
-                print("   3. OLLAMA 모델 사용으로 변경")
-                self.llm_type = "ollama"  # 폴백
+                print("   1. .env 파일에 ANTHROPIC_API_KEY 설정")
+                print("   2. 환경변수 설정: export ANTHROPIC_API_KEY='your-key'")
+                print("   3. OLLAMA 모델로 자동 전환")
+                self.init_llm_type = "ollama"  # 폴백
             else:
                 try:
                     self.claude_client = anthropic.Anthropic(api_key=self.claude_api_key)
                     print(f"✅ Claude API 클라이언트 초기화 완료: {self.claude_model}")
                 except Exception as e:
                     print(f"❌ Claude API 클라이언트 초기화 실패: {e}")
-                    self.llm_type = "ollama"  # 폴백
+                    self.init_llm_type = "ollama"  # 폴백
+        
+        # 2. OLLAMA 초기화 확인 (쿼리 생성용)
+        if self.init_llm_type == "ollama" or self.query_llm_type == "ollama":
+            if not self.check_ollama_connection():
+                print("❌ OLLAMA 서버 연결 실패")
+                if self.init_llm_type == "ollama":
+                    print("⚠️ 초기 분석에 필요한 LLM이 모두 사용 불가능합니다.")
+                    raise RuntimeError("사용 가능한 LLM이 없습니다.")
+            else:
+                print(f"✅ OLLAMA 서버 연결 성공: {self.codellama_model}")
     
     def connect_to_database(self) -> bool:
         """MariaDB에 연결"""
@@ -212,13 +228,20 @@ class HybridQueryGenerator:
     
     def disconnect_from_database(self):
         """데이터베이스 연결 종료"""
-        if self.connection:
-            self.connection.close()
-            print("🔌 MariaDB 연결 종료")
+        try:
+            if hasattr(self, 'connection') and self.connection:
+                self.connection.close()
+                print("🔌 MariaDB 연결 종료")
+        except Exception as e:
+            print(f"⚠️ MariaDB 연결 종료 중 오류: {e}")
         
-        if self.neo4j_driver:
-            self.neo4j_driver.close()
-            print("🔌 Neo4j 연결 종료")
+        if hasattr(self, 'neo4j_driver') and self.neo4j_driver:
+            try:
+                self.neo4j_driver.close()
+                print("🔌 Neo4j 연결 종료")
+            except Exception as e:
+                print(f"⚠️ Neo4j 연결 종료 중 오류: {e}")
+        
     
     def connect_to_neo4j(self) -> bool:
         """Neo4j에 연결"""
@@ -239,63 +262,63 @@ class HybridQueryGenerator:
             return False
     
     def check_ollama_connection(self) -> bool:
-        """OLLAMA 서버 연결 확인"""
-        if self.llm_type != "ollama":
-            return True  # OLLAMA 사용하지 않는 경우 스킵
-            
+        """OLLAMA 서버 연결 및 모델 사용 가능 여부 확인"""
         try:
+            # OLLAMA 서버 연결 확인
             response = requests.get(f"{self.ollama_url}/api/tags")
-            if response.status_code == 200:
-                print("✅ OLLAMA 서버 연결 성공!")
-                return True
-            else:
+            if response.status_code != 200:
                 print("❌ OLLAMA 서버 응답 오류")
+                print("💡 OLLAMA가 실행 중인지 확인하세요: ollama serve")
                 return False
+            
+            # 사용할 모델이 설치되어 있는지 확인
+            models = response.json().get('models', [])
+            available_models = [model['name'] for model in models]
+            
+            if self.codellama_model not in available_models:
+                print(f"❌ 모델 '{self.codellama_model}'이 설치되지 않았습니다.")
+                print("📋 사용 가능한 모델들:")
+                for model in available_models:
+                    print(f"  - {model}")
+                print(f"\n💡 모델 설치 명령: ollama pull {self.codellama_model}")
+                return False
+            
+            print(f"✅ OLLAMA 서버 연결 및 모델 '{self.codellama_model}' 사용 가능!")
+            return True
+            
         except Exception as e:
             print(f"❌ OLLAMA 서버 연결 실패: {e}")
             print("💡 OLLAMA가 실행 중인지 확인하세요: ollama serve")
             return False
     
     def check_model_availability(self) -> bool:
-        """모델 사용 가능성 확인"""
-        if self.llm_type == "claude":
-            # Claude API의 경우 API 키만 확인
-            return hasattr(self, 'claude_client')
+        """초기화 및 쿼리 생성용 모델 사용 가능성 확인"""
+        models_available = True
         
-        # OLLAMA 모델 확인
-        try:
-            response = requests.get(f"{self.ollama_url}/api/tags")
-            if response.status_code == 200:
-                models = response.json().get('models', [])
-                available_models = [model['name'] for model in models]
-                
-                if self.model_name in available_models:
-                    print(f"✅ 모델 '{self.model_name}' 사용 가능!")
-                    return True
-                else:
-                    print(f"❌ 모델 '{self.model_name}'이 설치되지 않았습니다.")
-                    print("📋 사용 가능한 모델들:")
-                    for model in available_models:
-                        print(f"  - {model}")
-                    
-                    # 4GB 메모리에 적합한 다른 모델 추천 (한글 지원 순서)
-                    recommended_models = [
-                        ("deepseek-coder:1.3b", "한글 지원 우수, 메모리 절약"),
-                        ("deepseek-coder:6.7b", "한글 지원 우수, 성능 최고"),
-                        ("codellama:7b-code", "다국어 지원, 메모리 많이 사용"),
-                        ("starcoder:3b", "영어 특화, 한글 제한적"),
-                        ("sqlcoder:7b", "SQL 특화, 영어 위주")
-                    ]
-                    
-                    print("\n💡 4GB 메모리에 추천되는 모델들 (한글 지원 순서):")
-                    for model, desc in recommended_models:
-                        print(f"  ollama pull {model}  # {desc}")
-                    
-                    return False
-            return False
-        except Exception as e:
-            print(f"❌ 모델 확인 실패: {e}")
-            return False
+        # 1. 초기화용 모델 확인
+        if self.init_llm_type == "claude":
+            if not hasattr(self, 'claude_client'):
+                print("❌ Claude API 클라이언트가 초기화되지 않았습니다.")
+                models_available = False
+        else:  # OLLAMA 사용
+            if not self.check_ollama_connection():
+                print("❌ 초기화용 OLLAMA 모델을 사용할 수 없습니다.")
+                models_available = False
+        
+        # 2. 쿼리 생성용 모델 확인 (항상 OLLAMA)
+        if not self.check_ollama_connection():
+            print("❌ 쿼리 생성용 OLLAMA 모델을 사용할 수 없습니다.")
+            models_available = False
+        
+        if models_available:
+            print("✅ 모든 필요한 모델이 사용 가능합니다!")
+            if self.init_llm_type == "claude":
+                print(f"  - 초기화: Claude ({self.claude_model})")
+            else:
+                print(f"  - 초기화: OLLAMA ({self.codellama_model})")
+            print(f"  - 쿼리 생성: OLLAMA ({self.codellama_model})")
+        
+        return models_available
     
     def call_claude_api(self, prompt: str) -> Optional[str]:
         """Claude API 호출"""
@@ -352,14 +375,64 @@ class HybridQueryGenerator:
             print(f"❌ OLLAMA 호출 중 오류: {e}")
             return None
     
-    def call_llm(self, prompt: str) -> Optional[str]:
-        """LLM 호출 - 설정된 모델 타입에 따라 분기"""
-        if self.llm_type == "claude":
-            return self.call_claude_api(prompt)
-        elif self.llm_type == "ollama":
-            return self.call_ollama_api(prompt)
+    def call_llm(self, prompt: str, stage: str = "init") -> Optional[str]:
+        """LLM 호출 - 단계별로 적절한 모델 사용
+        
+        Args:
+            prompt: 프롬프트 문자열
+            stage: 실행 단계
+                - "init": 초기 구성 (Claude 또는 OLLAMA)
+                - "table_search": 테이블 검색 (CodeLlama)
+                - "column_search": 컬럼 검색 (CodeLlama)
+                - "validation": 스키마 검증 (CodeLlama)
+                - "query_gen": 최종 쿼리 생성 (CodeLlama)
+        """
+        print(f"\n🤖 LLM 호출 단계: {stage}")
+        
+        if stage == "init":
+            # 초기 구성은 설정된 init_llm_type 사용
+            if self.init_llm_type == "claude":
+                print(f"📋 Claude 모델 사용: {self.claude_model}")
+                return self.call_claude_api(prompt)
+            else:
+                print(f"📋 OLLAMA 모델 사용: {self.codellama_model}")
+                return self.call_codellama_api(prompt)
         else:
-            print(f"❌ 지원하지 않는 LLM 타입: {self.llm_type}")
+            # 쿼리 생성 단계는 CodeLlama 사용
+            print(f"📋 CodeLlama 모델 사용: {self.codellama_model}")
+            return self.call_codellama_api(prompt)
+    
+    def call_codellama_api(self, prompt: str) -> Optional[str]:
+        """CodeLlama API 호출"""
+        try:
+            print(f"🤖 CodeLlama 호출: {self.codellama_model}")
+            
+            payload = {
+                "model": self.codellama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # 정확한 SQL 생성을 위해 낮은 온도
+                    "top_p": 0.9,
+                    "num_predict": 2000  # 토큰 수를 2000으로 증가
+                }
+            }
+            
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json=payload,
+                timeout=120  # 타임아웃을 120초로 증가 (큰 모델용)
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('response', '').strip()
+            else:
+                print(f"❌ CodeLlama 호출 실패: HTTP {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ CodeLlama 호출 중 오류: {e}")
             return None
     
     def get_all_tables(self) -> List[str]:
@@ -574,26 +647,66 @@ class HybridQueryGenerator:
         print("🔍 Foreign Key 관계 추출 중...")
         for table_name, schema in self.table_schemas.items():
             for fk in schema.foreign_keys:
+                # FK 컬럼 메타데이터 찾기
+                from_col_meta = next((col for col in schema.columns if col['name'] == fk['from_column']), None)
+                to_schema = self.table_schemas.get(fk['to_table'])
+                to_col_meta = next((col for col in to_schema.columns if col['name'] == fk['to_column']), None) if to_schema else None
+                
                 relations.append(TableRelation(
                     from_table=table_name,
                     from_column=fk['from_column'],
                     to_table=fk['to_table'],
                     to_column=fk['to_column'],
                     relation_type='foreign_key',
-                    confidence=1.0
+                    confidence=1.0,
+                    # 컬럼 메타데이터 추가
+                    from_column_type=from_col_meta.get('type', '') if from_col_meta else '',
+                    to_column_type=to_col_meta.get('type', '') if to_col_meta else '',
+                    from_column_desc=from_col_meta.get('comment', '') if from_col_meta else '',
+                    to_column_desc=to_col_meta.get('comment', '') if to_col_meta else '',
+                    is_nullable=from_col_meta.get('nullable', True) if from_col_meta else True,
+                    is_indexed=True  # FK는 일반적으로 인덱스가 있음
                 ))
         
         print(f"✅ Foreign Key 관계 {len(relations)}개 추출 완료")
         
         # 2. LLM 기반 의미적 관계 추출 (테이블 설명 분석)
         description_relations = self.extract_semantic_relations_from_descriptions()
+        
+        # 의미적 관계에 대해 가능한 컬럼 정보 추가
+        for rel in description_relations:
+            # 관련된 테이블의 주요 컬럼 찾기 (ID 또는 이름 컬럼)
+            from_schema = self.table_schemas.get(rel.from_table)
+            to_schema = self.table_schemas.get(rel.to_table)
+            
+            if from_schema and to_schema:
+                # 주요 컬럼 후보 (ID 컬럼 또는 이름 관련 컬럼)
+                from_col = next((col for col in from_schema.columns 
+                               if col['name'].endswith('_id') or 'name' in col['name'].lower()), None)
+                to_col = next((col for col in to_schema.columns 
+                             if col['name'].endswith('_id') or 'name' in col['name'].lower()), None)
+                
+                if from_col and to_col:
+                    rel.from_column = from_col['name']
+                    rel.to_column = to_col['name']
+                    rel.from_column_type = from_col.get('type', '')
+                    rel.to_column_type = to_col.get('type', '')
+                    rel.from_column_desc = from_col.get('comment', '')
+                    rel.to_column_desc = to_col.get('comment', '')
+                    rel.is_nullable = from_col.get('nullable', True)
+                    rel.is_indexed = from_col['name'].endswith('_id')  # ID 컬럼은 보통 인덱스가 있음
+        
         relations.extend(description_relations)
-        
         self.table_relations = relations
-        print(f"🔗 관계 추출 완료: {len(relations)}개 관계")
         
+        # 관계 정보 출력
+        print(f"🔗 총 {len(relations)}개 관계 추출 완료")
         for rel in relations:
-            print(f"  {rel.from_table}.{rel.from_column} → {rel.to_table}.{rel.to_column} ({rel.relation_type}, {rel.confidence})")
+            print(f"  {rel.from_table}.{rel.from_column} ({rel.from_column_type}) → "
+                  f"{rel.to_table}.{rel.to_column} ({rel.to_column_type})")
+            print(f"    유형: {rel.relation_type}, 신뢰도: {rel.confidence}")
+            if rel.from_column_desc or rel.to_column_desc:
+                print(f"    설명: {rel.from_column_desc} → {rel.to_column_desc}")
         
         return relations
     
@@ -607,13 +720,14 @@ class HybridQueryGenerator:
         
         # Neo4j에서 모든 테이블의 설명 정보 가져오기
         table_descriptions = self.get_table_descriptions_from_neo4j()
-        
+        print(table_descriptions)
         if len(table_descriptions) < 2:
             print("⚠️ 충분한 테이블 설명이 없어 의미적 관계 추출을 건너뜁니다.")
             return []
         
         # LLM을 활용하여 테이블 간 의미적 관계 분석
         semantic_relations = self.analyze_semantic_relationships_with_llm(table_descriptions)
+        print(semantic_relations)
         
         return semantic_relations
     
@@ -653,7 +767,7 @@ class HybridQueryGenerator:
             descriptions_text += f"- {table}: {desc}\n"
         
         # LLM 타입에 따른 최적화된 프롬프트 생성
-        if self.llm_type == "claude":
+        if self.current_llm == "claude":
             prompt = f"""{descriptions_text}
 
 위의 테이블 설명들을 분석하여 테이블 간 의미적 관계를 찾아주세요.
@@ -705,7 +819,7 @@ JSON 형식으로 응답:
 JSON:"""
         
         # LLM 호출
-        response = self.call_llm(prompt)
+        response = self.call_llm(prompt, stage="init")
         
         if response:
             try:
@@ -955,7 +1069,7 @@ JSON:"""
             ])
             
             # LLM 타입에 따른 프롬프트 생성
-            if self.llm_type == "claude":
+            if self.init_llm_type == "claude":
                 prompt = f"""다음은 데이터베이스의 모든 테이블과 설명입니다:
 
 {table_descriptions}
@@ -1338,25 +1452,163 @@ JSON:"""
         return len(errors) == 0, errors
     
     def generate_hybrid_sql_query(self, user_request: str) -> Optional[str]:
-        """Neo4j 그래프 정보를 활용한 하이브리드 SQL 쿼리 생성"""
-        # 1. 사용자 요청에서 관련 테이블 추출
-        relevant_tables = self.extract_relevant_tables(user_request)
+        """README.md의 방향성에 따른 단계별 SQL 쿼리 생성"""
+        print("\n🚀 단계별 SQL 쿼리 생성 시작...")
         
+        # 단계 1: CodeLlama로 대상 테이블 검색 (Neo4j 활용)
+        print("\n📋 단계 1: 대상 테이블 검색")
+        relevant_tables = self.find_target_tables(user_request)
         if not relevant_tables:
             print("❌ 관련 테이블을 찾을 수 없습니다.")
             return None
+        print(f"✅ 검색된 테이블: {relevant_tables}")
         
-        print(f"📊 관련 테이블: {relevant_tables}")
+        # 단계 2: CodeLlama로 필요한 컬럼 검색 (Neo4j 활용)
+        print("\n📋 단계 2: 필요 컬럼 검색")
+        relevant_columns = self.find_target_columns(user_request, relevant_tables)
+        if not relevant_columns:
+            print("❌ 필요한 컬럼을 찾을 수 없습니다.")
+            return None
+        print("✅ 검색된 컬럼:")
+        for table, columns in relevant_columns.items():
+            print(f"  - {table}: {', '.join(columns)}")
         
-        # 2. Neo4j에서 최적 조인 순서 찾기
-        join_sequence = self.find_optimal_join_sequence(relevant_tables)
+        # 단계 3: 검색된 테이블/컬럼 검증
+        print("\n📋 단계 3: 스키마 검증")
+        is_valid, errors = self.validate_schema_elements(relevant_tables, relevant_columns)
+        if not is_valid:
+            print("❌ 스키마 검증 실패:")
+            for error in errors:
+                print(f"  - {error}")
+            return None
+        print("✅ 스키마 검증 완료")
         
-        # 3. 그래프 정보와 스키마를 활용한 프롬프트 생성
-        enhanced_prompt = self.generate_enhanced_prompt(user_request, relevant_tables, join_sequence)
+        # 단계 4: CodeLlama로 최종 쿼리 생성
+        print("\n📋 단계 4: 최종 쿼리 생성")
+        final_query = self.generate_final_query(user_request, relevant_tables, relevant_columns)
+        if not final_query:
+            print("❌ 쿼리 생성 실패")
+            return None
         
-        # 4. LLM으로 쿼리 생성
-        print("🤖 Neo4j 그래프 정보를 활용하여 SQL 쿼리 생성 중...")
-        response = self.call_llm(enhanced_prompt)
+        print("✅ 쿼리 생성 완료")
+        return final_query
+    
+    def find_target_tables(self, user_request: str) -> List[str]:
+        """단계 1: CodeLlama를 사용하여 Neo4j에서 대상 테이블 검색"""
+        prompt = f"""다음 요청에 필요한 테이블들을 Neo4j에서 검색해주세요:
+
+사용자 요청: {user_request}
+
+Neo4j에서 테이블 관계와 설명을 검색하여, 이 요청을 처리하는데 필요한 테이블들을 찾아주세요.
+응답은 JSON 형식으로 반환해주세요:
+{{"tables": ["table1", "table2"], "reason": "선택 이유"}}"""
+
+        response = self.call_llm(prompt, stage="table_search")
+        if not response:
+            return []
+        
+        try:
+            import json
+            result = json.loads(response)
+            return result.get('tables', [])
+        except:
+            return []
+    
+    def find_target_columns(self, user_request: str, tables: List[str]) -> Dict[str, List[str]]:
+        """단계 2: CodeLlama를 사용하여 Neo4j에서 필요한 컬럼 검색"""
+        tables_str = ", ".join(tables)
+        prompt = f"""다음 요청을 처리하는데 필요한 컬럼들을 Neo4j에서 검색해주세요:
+
+사용자 요청: {user_request}
+대상 테이블: {tables_str}
+
+각 테이블에서 어떤 컬럼들이 필요한지 찾아주세요.
+응답은 JSON 형식으로 반환해주세요:
+{{"columns": {{"table1": ["col1", "col2"], "table2": ["col1", "col2"]}}}}"""
+
+        response = self.call_llm(prompt, stage="column_search")
+        if not response:
+            return {}
+        
+        try:
+            import json
+            result = json.loads(response)
+            return result.get('columns', {})
+        except:
+            return {}
+    
+    def validate_schema_elements(self, tables: List[str], columns: Dict[str, List[str]]) -> Tuple[bool, List[str]]:
+        """단계 3: 검색된 테이블과 컬럼이 실제 스키마와 일치하는지 검증"""
+        errors = []
+        
+        # 테이블 존재 여부 검증
+        for table in tables:
+            if table not in self.tables_info:
+                errors.append(f"존재하지 않는 테이블: {table}")
+        
+        # 컬럼 존재 여부 검증
+        for table, cols in columns.items():
+            if table not in self.tables_info:
+                continue
+            
+            available_columns = [col[0] for col in self.tables_info[table]['columns']]
+            for col in cols:
+                if col not in available_columns:
+                    errors.append(f"테이블 {table}에 존재하지 않는 컬럼: {col}")
+        
+        return len(errors) == 0, errors
+    
+    def generate_final_query(self, user_request: str, tables: List[str], columns: Dict[str, List[str]]) -> Optional[str]:
+        """단계 4: CodeLlama를 사용하여 최종 SQL 쿼리 생성"""
+        # 테이블과 컬럼 정보 포맷팅
+        schema_info = []
+        for table in tables:
+            if table in self.tables_info:
+                cols = columns.get(table, [])
+                schema_info.append(f"{table} ({', '.join(cols)})")
+        
+        schema_str = "\n".join(schema_info)
+        
+        prompt = f"""다음 정보를 바탕으로 SQL 쿼리를 생성해주세요:
+
+사용자 요청: {user_request}
+
+사용할 테이블과 컬럼:
+{schema_str}
+
+규칙:
+1. SELECT 문만 생성
+2. 정확한 테이블명과 컬럼명 사용
+3. 적절한 JOIN 조건 포함
+4. 필요한 WHERE 조건 추가
+
+SQL 쿼리:"""
+
+        response = self.call_llm(prompt, stage="query_gen")
+        if not response:
+            return None
+        
+        # SQL 쿼리 추출
+        lines = response.split('\n')
+        sql_lines = []
+        in_sql = False
+        
+        for line in lines:
+            line = line.strip()
+            if line.upper().startswith('SELECT'):
+                in_sql = True
+            if in_sql:
+                sql_lines.append(line)
+                if line.endswith(';'):
+                    break
+        
+        if sql_lines:
+            sql_query = ' '.join(sql_lines)
+            if not sql_query.endswith(';'):
+                sql_query += ';'
+            return sql_query
+        
+        return None
         
         if response:
             # SQL 쿼리 추출
@@ -1433,7 +1685,7 @@ SQL 쿼리:"""
                                 return None
                 else:
                     print("✅ SQL 쿼리 검증 성공")
-                    return sql_query
+                return sql_query
         
         return None
     
@@ -1454,7 +1706,7 @@ SQL 쿼리:"""
             schema_summary += f"  주요 컬럼: {', '.join(info['key_columns'])}\n"
         
         # LLM 타입과 모델별 최적화된 프롬프트
-        if self.llm_type == "claude":
+        if self.init_llm_type == "claude":
             # Claude는 한글을 매우 잘 지원하므로 상세한 한글 프롬프트 사용
             prompt = f"""{schema_summary}
 
@@ -1469,7 +1721,7 @@ SQL 쿼리:"""
 
 응답은 반드시 다음 JSON 형식으로만 반환해주세요:
 {{"tables": ["table1", "table2", "table3"], "reason": "선택 이유를 한 문장으로"}}"""
-        elif "gemma" in self.model_name.lower():
+        elif "gemma" in self.codellama_model.lower():
             # Gemma 모델용 특별 프롬프트
             prompt = f"""{schema_summary}
 
@@ -1492,9 +1744,11 @@ JSON:"""
 
 사용자 요청: {user_request}
 
-위의 테이블 스키마를 참고하여 사용자 요청에 맞는 정확한 SELECT SQL 쿼리를 생성해주세요.
+위의 테이블 스키마를 참고하여 사용자 요청에 필요한 테이블들을 선택해주세요.
 
-응답 형식:
+중요: JSON 형식으로만 응답하세요. 설명이나 예시는 포함하지 마세요.
+
+JSON:
 {{"tables": ["테이블명1", "테이블명2"], "reason": "선택 이유"}}
 
 JSON:"""
@@ -1551,7 +1805,7 @@ JSON:"""
             descriptions_text += f"- {table}: {desc}\n"
         
         # LLM을 활용한 테이블 선택
-        if self.llm_type == "claude":
+        if self.init_llm_type == "claude":
             prompt = f"""{descriptions_text}
 
 사용자 요청: "{user_request}"
@@ -1672,7 +1926,7 @@ JSON:"""
                 table_details += f"  주요 컬럼: {', '.join([col['name'] for col in schema.columns[:5]])}\n"
         
         # LLM 타입과 모델에 따른 프롬프트 선택
-        if self.llm_type == "claude":
+        if self.init_llm_type == "claude":
             # Claude는 한글을 매우 잘 지원하므로 한글 프롬프트 사용
             prompt = f"""{schema_info}
 
@@ -1693,44 +1947,34 @@ JSON:"""
 5. SQL 쿼리만 반환하고 추가 설명 없이
 
 SQL 쿼리:"""
-        elif "starcoder" in self.model_name.lower():
+        elif "starcoder" in self.codellama_model.lower():
             # StarCoder는 영어 위주로 학습되어 영어 프롬프트 사용
             prompt = f"""{schema_info}
 
-{join_info}
-
-{table_details}
-
 User Request: {user_request}
 
-Based on the schema above and the optimal join relationships from Neo4j graph analysis, generate an accurate SELECT SQL query.
-Use the join sequence provided to ensure optimal performance.
-
-Rules:
+Based on the table schema above, generate an accurate SELECT SQL query that meets the user's request.
+Please follow these rules:
 1. Use valid SQL syntax (MariaDB)
-2. Follow the recommended join order
-3. Include appropriate WHERE conditions
-4. Return only the SQL query
+2. Ensure table and column names are correct
+3. Add WHERE conditions if needed
+4. Return only the SQL query without additional explanations
+5. The query must start with SELECT
 
 SQL Query:"""
         else:
             # 기타 모델들은 한글 프롬프트 사용 (대부분 한글 지원)
             prompt = f"""{schema_info}
 
-{join_info}
-
-{table_details}
-
 사용자 요청: {user_request}
 
-위의 스키마와 Neo4j 그래프 분석을 통한 최적 조인 관계를 바탕으로 정확한 SELECT SQL 쿼리를 생성해주세요.
-제공된 조인 순서를 따라 최적의 성능을 보장하세요.
-
-규칙:
-1. 유효한 SQL 문법 사용
-2. 권장된 조인 순서 따르기
-3. 적절한 WHERE 조건 포함
-4. SQL 쿼리만 반환
+위의 테이블 스키마를 참고하여 사용자 요청에 맞는 정확한 SELECT SQL 쿼리를 생성해주세요.
+다음 규칙을 따라주세요:
+1. 반드시 유효한 SQL 문법을 사용하세요
+2. 테이블명과 컬럼명이 정확한지 확인하세요
+3. WHERE 조건이 필요한 경우 적절히 추가하세요
+4. 결과는 SQL 쿼리만 반환하고 부가 설명은 제외하세요
+5. 쿼리는 SELECT로 시작해야 합니다
 
 SQL 쿼리:"""
         
@@ -1741,7 +1985,7 @@ SQL 쿼리:"""
         schema_info = self.generate_schema_prompt()
         
         # LLM 타입과 모델에 따른 프롬프트 선택
-        if self.llm_type == "claude":
+        if self.init_llm_type == "claude":
             # Claude는 한글을 매우 잘 지원하므로 한글 프롬프트 사용
             prompt = f"""{schema_info}
 
@@ -1757,7 +2001,7 @@ SQL 쿼리:"""
 5. 쿼리는 SELECT로 시작해야 합니다
 
 SQL 쿼리:"""
-        elif "starcoder" in self.model_name.lower():
+        elif "starcoder" in self.codellama_model.lower():
             # StarCoder는 영어 위주로 학습되어 영어 프롬프트 사용
             prompt = f"""{schema_info}
 
@@ -1789,7 +2033,7 @@ SQL Query:"""
 SQL 쿼리:"""
 
         print("🤖 LLM이 SQL 쿼리를 생성 중...")
-        response = self.call_llm(prompt)
+        response = self.call_llm(prompt, stage="query_gen")
         
         if response:
             # SQL 쿼리 추출 (코드 블록 제거 등)
@@ -1863,212 +2107,115 @@ SQL 쿼리:"""
     def run_interactive_mode(self):
         """대화형 모드 실행"""
         try:
+            # 시작 메시지 및 설정 표시
             print("=" * 70)
             print("🚀 하이브리드 SQL 쿼리 생성기 시작 (MariaDB + Neo4j)")
-            print(f"🤖 사용 중인 LLM: {self.llm_type.upper()}")
-            if self.llm_type == "claude":
-                print(f"📋 모델: {self.claude_model}")
+            print("\n📋 LLM 설정:")
+            print(f"  - 초기 분석: {self.init_llm_type.upper()}")
+            if self.init_llm_type == "claude":
+                print(f"    모델: {self.claude_model}")
             else:
-                print(f"📋 모델: {self.model_name}")
+                print(f"    모델: {self.codellama_model}")
+            print(f"  - 쿼리 생성: {self.query_llm_type.upper()}")
+            print(f"    모델: {self.codellama_model}")
             print("=" * 70)
             
-            # MariaDB 연결 확인
-            if not self.connect_to_database():
-                return
-            
-            # LLM 연결 및 모델 확인
-            if self.llm_type == "ollama":
-                if not self.check_ollama_connection():
+            # 초기화 단계
+            try:
+                # MariaDB 연결 확인
+                if not self.connect_to_database():
                     return
                 
+                # LLM 모델 가용성 확인
                 if not self.check_model_availability():
-                    print("\n💡 OLLAMA 모델을 먼저 설치해주세요:")
-                    print(f"ollama pull {self.model_name}")
+                    return  # 오류 메시지는 check_model_availability에서 출력됨
+                
+                # 테이블 분석
+                self.analyze_all_tables()
+                
+                if not self.tables_info:
+                    print("❌ 분석할 테이블이 없습니다.")
                     return
-            elif self.llm_type == "claude":
-                if not self.check_model_availability():
-                    print("\n💡 Claude API 설정을 확인해주세요:")
-                    print("1. ANTHROPIC_API_KEY 환경변수 설정")
-                    print("2. anthropic 라이브러리 설치: pip install anthropic")
-                    return
-            
-            # 테이블 분석
-            self.analyze_all_tables()
-            
-            if not self.tables_info:
-                print("❌ 분석할 테이블이 없습니다.")
-                return
-            
-            # Neo4j 연결 및 스키마 그래프 생성
-            neo4j_available = self.connect_to_neo4j()
-            
-            if neo4j_available:
-                print("\n🔄 스키마 그래프 분석 중...")
-                self.extract_schema_from_ddl()
-                self.extract_table_relations()
-                self.create_schema_graph_in_neo4j()
-                print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 사용)")
-            else:
-                print("⚠️  기본 모드로 실행 (Neo4j 없이)")
-            
-            print("\n" + "=" * 60)
-            print("🎯 대화형 SQL 쿼리 생성 모드")
-            print("종료하려면 'quit' 또는 'exit'를 입력하세요")
-            print("=" * 60)
-            
-            while True:
-                try:
-                    user_input = input("\n📝 검색하고 싶은 내용을 설명해주세요: ").strip()
-                    
-                    if user_input.lower() in ['quit', 'exit', '종료']:
-                        break
-                    
-                    if not user_input:
-                        continue
-                    
-                    # SQL 쿼리 생성 (하이브리드 모드 우선)
-                    if neo4j_available:
-                        generated_query = self.generate_hybrid_sql_query(user_input)
-                    else:
-                        generated_query = self.generate_sql_query(user_input)
-                    
-                    if generated_query:
-                        print(f"\n✨ 생성된 SQL 쿼리:")
-                        print(f"```sql\n{generated_query}\n```")
+                
+                # Neo4j 연결 및 스키마 그래프 생성
+                neo4j_available = self.connect_to_neo4j()
+                
+                if neo4j_available:
+                    print("\n🔄 스키마 그래프 분석 중...")
+                    self.extract_schema_from_ddl()
+                    self.extract_table_relations()
+                    self.create_schema_graph_in_neo4j()
+                    print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 사용)")
+                else:
+                    print("⚠️  기본 모드로 실행 (Neo4j 없이)")
+                
+                print("\n" + "=" * 60)
+                print("�� 대화형 SQL 쿼리 생성 모드")
+                print("종료하려면 'quit' 또는 'exit'를 입력하세요")
+                print("=" * 60)
+                
+                # 대화형 루프
+                while True:
+                    try:
+                        user_input = input("\n📝 검색하고 싶은 내용을 설명해주세요: ").strip()
                         
-                        # 쿼리 실행 여부 확인
-                        execute = input("\n실행하시겠습니까? (y/n): ").strip().lower()
+                        if user_input.lower() in ['quit', 'exit', '종료']:
+                            break
                         
-                        if execute in ['y', 'yes', 'ㅇ']:
-                            results = self.execute_query(generated_query)
+                        if not user_input:
+                            continue
+                        
+                        # SQL 쿼리 생성 (하이브리드 모드 우선)
+                        if neo4j_available:
+                            generated_query = self.generate_hybrid_sql_query(user_input)
+                        else:
+                            generated_query = self.generate_sql_query(user_input)
+                        
+                        if generated_query:
+                            print(f"\n✨ 생성된 SQL 쿼리:")
+                            print(f"```sql\n{generated_query}\n```")
                             
-                            if results is not None:
-                                print(f"\n📊 실행 결과 ({len(results)}개 행):")
+                            # 쿼리 실행 여부 확인
+                            execute = input("\n실행하시겠습니까? (y/n): ").strip().lower()
+                            
+                            if execute in ['y', 'yes', 'ㅇ']:
+                                results = self.execute_query(generated_query)
                                 
-                                if results:
-                                    for i, row in enumerate(results[:10], 1):  # 최대 10개만 표시
-                                        print(f"  {i}: {row}")
+                                if results is not None:
+                                    print(f"\n📊 실행 결과 ({len(results)}개 행):")
                                     
-                                    if len(results) > 10:
-                                        print(f"  ... 및 {len(results) - 10}개 행 더")
+                                    if results:
+                                        for i, row in enumerate(results[:10], 1):  # 최대 10개만 표시
+                                            print(f"  {i}: {row}")
+                                        
+                                        if len(results) > 10:
+                                            print(f"  ... 및 {len(results) - 10}개 행 더")
+                                    else:
+                                        print("  결과가 없습니다.")
                                 else:
-                                    print("  결과가 없습니다.")
-                    else:
-                        print("❌ SQL 쿼리 생성에 실패했습니다.")
+                                    print("❌ 쿼리 실행에 실패했습니다.")
+                        else:
+                            print("❌ SQL 쿼리 생성에 실패했습니다.")
                         
-                except KeyboardInterrupt:
-                    print("\n\n👋 프로그램을 종료합니다.")
-                    break
-                except Exception as e:
-                    print(f"❌ 오류 발생: {e}")
-                    import traceback
-                    print("💡 오류 상세:")
-                    print(traceback.format_exc())
+                    except KeyboardInterrupt:
+                        print("\n\n👋 프로그램을 종료합니다.")
+                        break
+                    except Exception as e:
+                        print(f"❌ 대화형 모드 실행 중 오류: {e}")
+                        import traceback
+                        print("💡 오류 상세:")
+                        print(traceback.format_exc())
             
-            self.disconnect_from_database()
-            print("🏁 프로그램이 종료되었습니다.")
-            
+            finally:
+                self.disconnect_from_database()
+                print("🏁 프로그램이 종료되었습니다.")
+                
         except Exception as e:
-            print(f"❌ 프로그램 실행 중 오류 발생: {e}")
+            print(f"❌ 프로그램 초기화 중 오류 발생: {e}")
             import traceback
             print("💡 오류 상세:")
             print(traceback.format_exc())
             self.disconnect_from_database()
-        
-        # MariaDB 연결 확인
-        if not self.connect_to_database():
-            return
-        
-        # LLM 연결 및 모델 확인
-        if self.llm_type == "ollama":
-            if not self.check_ollama_connection():
-                return
-            
-            if not self.check_model_availability():
-                print("\n💡 OLLAMA 모델을 먼저 설치해주세요:")
-                print(f"ollama pull {self.model_name}")
-                return
-        elif self.llm_type == "claude":
-            if not self.check_model_availability():
-                print("\n💡 Claude API 설정을 확인해주세요:")
-                print("1. ANTHROPIC_API_KEY 환경변수 설정")
-                print("2. anthropic 라이브러리 설치: pip install anthropic")
-                return
-        
-        # 테이블 분석
-        self.analyze_all_tables()
-        
-        if not self.tables_info:
-            print("❌ 분석할 테이블이 없습니다.")
-            return
-        
-        # Neo4j 연결 및 스키마 그래프 생성
-        neo4j_available = self.connect_to_neo4j()
-        
-        if neo4j_available:
-            print("\n🔄 스키마 그래프 분석 중...")
-            self.extract_schema_from_ddl()
-            self.extract_table_relations()
-            self.create_schema_graph_in_neo4j()
-            print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 사용)")
-        else:
-            print("⚠️  기본 모드로 실행 (Neo4j 없이)")
-        
-        print("\n" + "=" * 60)
-        print("🎯 대화형 SQL 쿼리 생성 모드")
-        print("종료하려면 'quit' 또는 'exit'를 입력하세요")
-        print("=" * 60)
-        
-        while True:
-            try:
-                user_input = input("\n📝 검색하고 싶은 내용을 설명해주세요: ").strip()
-                
-                if user_input.lower() in ['quit', 'exit', '종료']:
-                    break
-                
-                if not user_input:
-                    continue
-                
-                # SQL 쿼리 생성 (하이브리드 모드 우선)
-                if neo4j_available:
-                    generated_query = self.generate_hybrid_sql_query(user_input)
-                else:
-                    generated_query = self.generate_sql_query(user_input)
-                
-                if generated_query:
-                    print(f"\n✨ 생성된 SQL 쿼리:")
-                    print(f"```sql\n{generated_query}\n```")
-                    
-                    # 쿼리 실행 여부 확인
-                    execute = input("\n실행하시겠습니까? (y/n): ").strip().lower()
-                    
-                    if execute in ['y', 'yes', 'ㅇ']:
-                        results = self.execute_query(generated_query)
-                        
-                        if results is not None:
-                            print(f"\n📊 실행 결과 ({len(results)}개 행):")
-                            
-                            if results:
-                                for i, row in enumerate(results[:10], 1):  # 최대 10개만 표시
-                                    print(f"  {i}: {row}")
-                                
-                                if len(results) > 10:
-                                    print(f"  ... 및 {len(results) - 10}개 행 더")
-                            else:
-                                print("  결과가 없습니다.")
-                        else:
-                            print("❌ 쿼리 실행에 실패했습니다.")
-                else:
-                    print("❌ SQL 쿼리 생성에 실패했습니다.")
-                    
-            except KeyboardInterrupt:
-                print("\n\n👋 프로그램을 종료합니다.")
-                break
-            except Exception as e:
-                print(f"❌ 오류 발생: {e}")
-        
-        self.disconnect_from_database()
-        print("🏁 프로그램이 종료되었습니다.")
 
 def main():
     """메인 함수"""
