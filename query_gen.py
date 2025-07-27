@@ -76,7 +76,7 @@ CREATE TABLE order_items (
     product_id INT NOT NULL COMMENT '주문된 상품 ID',
     quantity INT NOT NULL COMMENT '주문 수량',
     unit_price DECIMAL(10, 2) NOT NULL COMMENT '주문 당시 상품 단가',
-    subtotal DECIMAL(10, 2) NOT NULL COMMENT '해당 상품의 주문 소계 (수량 × 단가)',
+    subtotal DECIMAL(10, 2) NOT NULL COMMENT '해당 상품의 주문 소계',
     FOREIGN KEY (order_id) REFERENCES orders(order_id),
     FOREIGN KEY (product_id) REFERENCES products(product_id)
 ) COMMENT = '주문에 포함된 개별 상품 정보를 저장하는 테이블';
@@ -94,120 +94,6 @@ CREATE TABLE reviews (
     FOREIGN KEY (product_id) REFERENCES products(product_id),
     FOREIGN KEY (order_id) REFERENCES orders(order_id)
 );
-
--- 샘플 데이터 삽입
-
--- 카테고리 데이터
-INSERT INTO categories (category_name, parent_category_id, description) VALUES
-('전자제품', NULL, '모든 전자제품'),
-('의류', NULL, '의류 및 패션'),
-('도서', NULL, '책 및 교육자료'),
-('스마트폰', 1, '휴대폰 및 액세서리'),
-('노트북', 1, '노트북 및 컴퓨터'),
-('남성의류', 2, '남성용 의류'),
-('여성의류', 2, '여성용 의류'),
-('IT도서', 3, 'IT 관련 도서');
-
--- 사용자 데이터
-INSERT INTO users (username, email, full_name, status) VALUES
-('john_doe', 'john@example.com', '홍길동', 'active'),
-('jane_smith', 'jane@example.com', '김영희', 'active'),
-('bob_wilson', 'bob@example.com', '박철수', 'active'),
-('alice_brown', 'alice@example.com', '이순신', 'inactive'),
-('charlie_davis', 'charlie@example.com', '정약용', 'active');
-
--- 상품 데이터
-INSERT INTO products (product_name, category_id, price, stock_quantity, description, status) VALUES
-('아이폰 15 Pro', 4, 1200000.00, 50, '최신 아이폰 모델', 'active'),
-('갤럭시 S24', 4, 1100000.00, 30, '삼성 최신 스마트폰', 'active'),
-('맥북 프로 M3', 5, 2500000.00, 20, '애플 노트북', 'active'),
-('델 XPS 13', 5, 1800000.00, 25, '델 프리미엄 노트북', 'active'),
-('남성 정장', 6, 250000.00, 40, '고급 정장', 'active'),
-('여성 원피스', 7, 120000.00, 60, '우아한 원피스', 'active'),
-('클린 코드', 8, 35000.00, 100, '로버트 마틴의 클린 코드', 'active'),
-('리팩터링', 8, 40000.00, 80, '마틴 파울러의 리팩터링', 'active');
-
--- 주문 데이터
-INSERT INTO orders (user_id, total_amount, status, shipping_address) VALUES
-(1, 1235000.00, 'delivered', '서울시 강남구 테헤란로 123'),
-(2, 1140000.00, 'shipped', '부산시 해운대구 센텀로 456'),
-(3, 370000.00, 'processing', '대구시 수성구 동대구로 789'),
-(1, 2540000.00, 'pending', '서울시 강남구 테헤란로 123'),
-(4, 75000.00, 'cancelled', '인천시 연수구 송도대로 321');
-
--- 주문 상세 데이터
-INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES
-(1, 1, 1, 1200000.00, 1200000.00),
-(1, 7, 1, 35000.00, 35000.00),
-(2, 2, 1, 1100000.00, 1100000.00),
-(2, 8, 1, 40000.00, 40000.00),
-(3, 5, 1, 250000.00, 250000.00),
-(3, 6, 1, 120000.00, 120000.00),
-(4, 3, 1, 2500000.00, 2500000.00),
-(4, 8, 1, 40000.00, 40000.00),
-(5, 7, 1, 35000.00, 35000.00),
-(5, 8, 1, 40000.00, 40000.00);
-
--- 리뷰 데이터
-INSERT INTO reviews (user_id, product_id, order_id, rating, review_text) VALUES
-(1, 1, 1, 5, '정말 훌륭한 스마트폰입니다!'),
-(1, 7, 1, 4, '개발자에게 필수 도서네요'),
-(2, 2, 2, 4, '성능이 우수합니다'),
-(2, 8, 2, 5, '리팩터링 기법을 잘 설명한 책'),
-(3, 5, 3, 3, '가격 대비 괜찮습니다'),
-(3, 6, 3, 5, '디자인이 아름답습니다');
-
--- 조인 테스트를 위한 예제 쿼리들
-
--- 4개 테이블 조인 예제 1: 사용자별 주문 상품 정보
-/*
-SELECT 
-    u.username,
-    u.full_name,
-    o.order_id,
-    p.product_name,
-    oi.quantity,
-    oi.unit_price
-FROM users u
-JOIN orders o ON u.user_id = o.user_id
-JOIN order_items oi ON o.order_id = oi.order_id
-JOIN products p ON oi.product_id = p.product_id
-WHERE u.status = 'active';
-*/
-
--- 5개 테이블 조인 예제: 카테고리별 주문 통계
-/*
-SELECT 
-    c.category_name,
-    u.username,
-    COUNT(oi.order_item_id) as total_items_ordered,
-    SUM(oi.subtotal) as total_amount
-FROM categories c
-JOIN products p ON c.category_id = p.category_id
-JOIN order_items oi ON p.product_id = oi.product_id
-JOIN orders o ON oi.order_id = o.order_id
-JOIN users u ON o.user_id = u.user_id
-GROUP BY c.category_id, u.user_id;
-*/
-
--- 6개 테이블 조인 예제: 리뷰가 있는 주문 정보
-/*
-SELECT 
-    u.username,
-    o.order_id,
-    p.product_name,
-    c.category_name,
-    oi.quantity,
-    r.rating,
-    r.review_text
-FROM users u
-JOIN orders o ON u.user_id = o.user_id
-JOIN order_items oi ON o.order_id = oi.order_id
-JOIN products p ON oi.product_id = p.product_id
-JOIN categories c ON p.category_id = c.category_id
-JOIN reviews r ON (u.user_id = r.user_id AND p.product_id = r.product_id AND o.order_id = r.order_id)
-ORDER BY r.rating DESC;
-*/
 """
 
 import pymysql
@@ -857,6 +743,157 @@ class HybridQueryGenerator:
             
             return paths
     
+    def search_tables_with_graph_metadata(self, user_request: str) -> List[str]:
+        """Neo4j 그래프 메타 정보를 활용한 순수 그래프 기반 테이블 검색"""
+        if not self.neo4j_driver:
+            print("❌ Neo4j 연결이 필요합니다. 키워드 방식으로 폴백합니다.")
+            return self.extract_relevant_tables_fallback(user_request)
+        
+        print("🔍 Neo4j 그래프 메타 정보로 의미적 테이블 검색 중...")
+        
+        with self.neo4j_driver.session() as session:
+            # 1단계: LLM을 활용한 의미적 테이블 검색
+            print("🧠 LLM이 사용자 요청을 분석하여 관련 테이블을 찾는 중...")
+            
+            # 모든 테이블과 설명 정보 가져오기
+            all_tables_query = """
+            MATCH (t:Table)
+            RETURN t.name as table_name, t.comment as comment
+            ORDER BY t.name
+            """
+            
+            all_tables = session.run(all_tables_query)
+            table_info = []
+            for record in all_tables:
+                table_info.append({
+                    'name': record['table_name'],
+                    'description': record['comment']
+                })
+            
+            # LLM에게 의미적 분석 요청
+            table_descriptions = "\n".join([
+                f"- {table['name']}: {table['description']}" 
+                for table in table_info
+            ])
+            
+            # LLM 타입에 따른 프롬프트 생성
+            if self.llm_type == "claude":
+                prompt = f"""다음은 데이터베이스의 모든 테이블과 설명입니다:
+
+{table_descriptions}
+
+사용자 요청: "{user_request}"
+
+위의 테이블 설명을 바탕으로 사용자 요청을 처리하는데 필요한 테이블들을 의미적으로 분석하여 선택해주세요.
+
+분석 기준:
+1. 사용자가 원하는 정보와 직접적으로 관련된 테이블
+2. 데이터를 조인하기 위해 필요한 중간 테이블
+3. 비즈니스 로직상 함께 조회되어야 하는 테이블
+
+응답은 반드시 다음 JSON 형식으로만 반환해주세요:
+{{"selected_tables": ["table1", "table2"], "reasoning": "선택 이유를 설명"}}"""
+            else:
+                prompt = f"""데이터베이스 테이블 정보:
+{table_descriptions}
+
+사용자 요청: {user_request}
+
+위 테이블들 중에서 사용자 요청을 처리하는데 필요한 테이블들을 선택하여 JSON으로 반환해주세요.
+
+JSON 형식:
+{{"selected_tables": ["테이블명1", "테이블명2"], "reasoning": "선택 이유"}}
+
+JSON:"""
+            
+            # LLM 호출
+            llm_response = self.call_llm(prompt)
+            selected_tables = []
+            
+            if llm_response:
+                try:
+                    # JSON 파싱
+                    import json
+                    response_clean = llm_response.strip()
+                    
+                    # JSON 블록 찾기
+                    json_start = response_clean.find('{')
+                    json_end = response_clean.rfind('}') + 1
+                    
+                    if json_start >= 0 and json_end > json_start:
+                        json_str = response_clean[json_start:json_end]
+                        result = json.loads(json_str)
+                        
+                        if 'selected_tables' in result:
+                            selected_tables = result['selected_tables']
+                            reasoning = result.get('reasoning', '')
+                            
+                            print(f"🎯 LLM 선택 결과: {selected_tables}")
+                            print(f"📝 선택 이유: {reasoning}")
+                            
+                except (json.JSONDecodeError, Exception) as e:
+                    print(f"⚠️ LLM 응답 파싱 실패: {e}")
+                    selected_tables = []
+            
+            # 2단계: 그래프 기반 연관 테이블 확장
+            if selected_tables:
+                print("🔗 그래프에서 연관 테이블 자동 확장 중...")
+                
+                # 선택된 테이블들과 연결된 테이블 찾기
+                expand_query = """
+                MATCH (selected:Table)-[:REFERENCES*1..2]-(related:Table)
+                WHERE selected.name IN $selected_tables 
+                  AND NOT related.name IN $selected_tables
+                RETURN DISTINCT related.name as related_table, 
+                       related.comment as comment,
+                       shortestPath((selected)-[:REFERENCES*1..2]-(related)) as path
+                ORDER BY length(path), related_table
+                LIMIT 3
+                """
+                
+                expand_results = session.run(expand_query, selected_tables=selected_tables)
+                
+                for record in expand_results:
+                    related_table = record['related_table']
+                    comment = record['comment']
+                    path_length = len(record['path'].relationships)
+                    
+                    # 관계 거리가 가까운 중요한 테이블만 추가
+                    if path_length <= 2:
+                        selected_tables.append(related_table)
+                        print(f"  + {related_table}: {comment} (거리: {path_length})")
+            
+            # 3단계: 폴백 - LLM 분석이 실패한 경우
+            if not selected_tables:
+                print("⚠️ LLM 분석 실패. 그래프 중심성 기반으로 주요 테이블 선택...")
+                
+                # 테이블 중심성(연결도) 기반 선택
+                centrality_query = """
+                MATCH (t:Table)
+                OPTIONAL MATCH (t)-[r:REFERENCES]-(other:Table)
+                WITH t, count(r) as connections
+                ORDER BY connections DESC, t.name
+                LIMIT 4
+                RETURN t.name as table_name, t.comment as comment, connections
+                """
+                
+                centrality_results = session.run(centrality_query)
+                for record in centrality_results:
+                    table_name = record['table_name']
+                    comment = record['comment']
+                    connections = record['connections']
+                    selected_tables.append(table_name)
+                    print(f"  - {table_name}: {comment} (연결수: {connections})")
+            
+            # 4단계: 최종 검증 및 정리
+            final_tables = []
+            for table in selected_tables:
+                if table in self.table_schemas and table not in final_tables:
+                    final_tables.append(table)
+            
+            print(f"✅ 최종 선택된 테이블: {final_tables}")
+            return final_tables[:6]  # 최대 6개 테이블로 제한
+    
     def find_optimal_join_sequence(self, required_tables: List[str]) -> List[Dict]:
         """필요한 테이블들을 조인하는 최적 순서 찾기"""
         if not self.neo4j_driver or len(required_tables) < 2:
@@ -1068,7 +1105,7 @@ JSON:"""
 
 사용자 요청: {user_request}
 
-위의 테이블 스키마를 참고하여 사용자 요청을 처리하는데 필요한 테이블들을 JSON 형태로 반환해주세요.
+위의 테이블 스키마를 참고하여 사용자 요청에 맞는 정확한 SELECT SQL 쿼리를 생성해주세요.
 
 응답 형식:
 {{"tables": ["테이블명1", "테이블명2"], "reason": "선택 이유"}}
@@ -1138,9 +1175,9 @@ JSON:"""
         return relevant_tables
     
     def extract_relevant_tables(self, user_request: str) -> List[str]:
-        """사용자 요청에서 관련 테이블 추출 (LLM 우선, 키워드 폴백)"""
-        # LLM 기반 추출 시도
-        return self.extract_relevant_tables_with_llm(user_request)
+        """사용자 요청에서 관련 테이블 추출 (그래프 기반 검색)"""
+        # Neo4j 그래프 메타 정보 기반 검색
+        return self.search_tables_with_graph_metadata(user_request)
     
     def generate_enhanced_prompt(self, user_request: str, relevant_tables: List[str], join_sequence: List[Dict]) -> str:
         """Neo4j 정보를 활용한 향상된 프롬프트 생성"""
