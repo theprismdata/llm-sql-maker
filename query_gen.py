@@ -1,26 +1,6 @@
 """
 Code LLM을 이용한 SELECT QUERY 생성 (Hybrid: OLLAMA + Claude API 지원)
 
-LLM 모델 선택 방법:
-1. OLLAMA 사용: __init__ 함수에서 self.llm_type = "ollama" (기본값)
-2. Claude API 사용: __init__ 함수에서 주석을 해제하여 self.llm_type = "claude" 설정
-
-Claude API 사용 시 필요사항:
-- pip install anthropic
-- 환경변수 설정: export ANTHROPIC_API_KEY='your-api-key'
-"""
-"""
-DB ADDRESS
-222.239.231.95 : 32000
-db : llm_db_test
-user : genai
-password : Zx82qm730!
-"""
-
-"""
--- llm_db_test 데이터베이스용 테이블 생성 쿼리 (MariaDB)
--- 4개 이상의 테이블 조인 테스트를 위한 전자상거래 시스템
-
 USE llm_db_test;
 
 -- 1. 사용자 테이블
@@ -105,10 +85,31 @@ import os
 from typing import List, Dict, Any, Optional, Tuple
 from neo4j import GraphDatabase
 from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
+import anthropic
+
+# .env 파일 로드
+try:
+    
+    # .env 파일 찾기 (현재 디렉토리 또는 상위 디렉토리에서)
+    env_path = Path('.env')
+    if not env_path.exists():
+        parent_env = Path('..') / '.env'
+        if parent_env.exists():
+            env_path = parent_env
+    
+    if env_path.exists():
+        print(f"✅ .env 파일 로드: {env_path}")
+        load_dotenv(env_path)
+    else:
+        print("⚠️ .env 파일을 찾을 수 없습니다.")
+except ImportError:
+    print("⚠️ python-dotenv 패키지가 필요합니다. pip install python-dotenv")
 
 # Claude API 사용을 위한 import (설치 필요: pip install anthropic)
 try:
-    import anthropic
+    
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
@@ -151,18 +152,25 @@ class HybridQueryGenerator:
             'password': 'password123'
         }
         
-        # LLM 모델 설정 - 원하는 모델의 주석을 해제하세요
+        # LLM 모델 설정
         # =================================================================
         
-        on_local = True
-        if on_local:
+        # 사용할 LLM 모델 선택 (원하는 모델 선택)
+        LLM_MODEL = "ollama"  # "claude" 또는 "ollama" 선택
+        
+        if LLM_MODEL == "claude":
+            self.llm_type = "claude"
+            self.claude_model = "claude-3-sonnet-20240229"  # 최신 Claude 모델
+            self.claude_api_key = os.getenv('ANTHROPIC_API_KEY', "")  # 환경변수에서 API 키 읽기
+        else:
             self.llm_type = "ollama"
             self.ollama_url = "http://localhost:11434"
-            self.model_name = "codellama:7b"  # 4GB 메모리에 적합하고 한글 지원 우수 (빠름)
-        else:
-            self.llm_type = "claude"
-            self.claude_model = "claude-3-5-sonnet-20241022"  # 최신 Claude 모델
-            self.claude_api_key = os.getenv('ANTHROPIC_API_KEY', "")  # 환경변수에서 API 키 읽기
+            # 사용 가능한 OLLAMA 모델들:
+            # - codellama:7b       : 4GB 메모리에 적합하고 한글 지원 우수 (빠름)
+            # - deepseek-coder:6.7b: 성능 최고, 한글 지원 우수
+            # - deepseek-coder:1.3b: 메모리 절약, 한글 지원 우수
+            # - sqlcoder:7b        : SQL 특화, 영어 위주
+            self.model_name = "codellama:7b"
 
         
         self.connection = None
@@ -559,10 +567,11 @@ class HybridQueryGenerator:
         return schemas
     
     def extract_table_relations(self) -> List[TableRelation]:
-        """테이블 간 관계 추출"""
+        """테이블 간 관계 추출 - Foreign Key와 LLM 기반 의미적 분석만 사용"""
         relations = []
         
-        # 1. Foreign Key 관계 추출
+        # 1. Foreign Key 관계 추출 (데이터베이스 스키마에서 명시적으로 정의된 관계)
+        print("🔍 Foreign Key 관계 추출 중...")
         for table_name, schema in self.table_schemas.items():
             for fk in schema.foreign_keys:
                 relations.append(TableRelation(
@@ -574,71 +583,180 @@ class HybridQueryGenerator:
                     confidence=1.0
                 ))
         
-        # 2. 의미적 관계 추출 (컬럼명 기반)
-        for table1_name, schema1 in self.table_schemas.items():
-            for table2_name, schema2 in self.table_schemas.items():
-                if table1_name != table2_name:
-                    for col1 in schema1.columns:
-                        for col2 in schema2.columns:
-                            # ID 컬럼 매칭 (예: user_id → user_id)
-                            if (col1['name'] == col2['name'] and 
-                                'id' in col1['name'].lower() and 
-                                col1['name'] not in [fk['from_column'] for fk in schema1.foreign_keys]):
-                                
-                                # 이미 FK 관계가 있는지 확인
-                                existing = any(
-                                    r.from_table == table1_name and 
-                                    r.from_column == col1['name'] and
-                                    r.to_table == table2_name and
-                                    r.to_column == col2['name']
-                                    for r in relations
-                                )
-                                
-                                if not existing:
-                                    relations.append(TableRelation(
-                                        from_table=table1_name,
-                                        from_column=col1['name'],
-                                        to_table=table2_name,
-                                        to_column=col2['name'],
-                                        relation_type='semantic',
-                                        confidence=0.8
-                                    ))
+        print(f"✅ Foreign Key 관계 {len(relations)}개 추출 완료")
         
-        # 3. 네이밍 패턴 기반 관계 (예: user_id → users.user_id)
-        for table1_name, schema1 in self.table_schemas.items():
-            for col in schema1.columns:
-                if col['name'].endswith('_id') and col['name'] != f"{table1_name}_id":
-                    # 테이블명 추정
-                    potential_table = col['name'][:-3]  # _id 제거
-                    potential_table_plural = potential_table + 's'
-                    
-                    for table2_name, schema2 in self.table_schemas.items():
-                        if table2_name in [potential_table, potential_table_plural]:
-                            primary_key = next((pk for pk in schema2.primary_keys), None)
-                            if primary_key == col['name']:
-                                # 이미 관계가 있는지 확인
-                                existing = any(
-                                    r.from_table == table1_name and 
-                                    r.from_column == col['name'] and
-                                    r.to_table == table2_name
-                                    for r in relations
-                                )
-                                
-                                if not existing:
-                                    relations.append(TableRelation(
-                                        from_table=table1_name,
-                                        from_column=col['name'],
-                                        to_table=table2_name,
-                                        to_column=primary_key,
-                                        relation_type='naming_pattern',
-                                        confidence=0.7
-                                    ))
+        # 2. LLM 기반 의미적 관계 추출 (테이블 설명 분석)
+        description_relations = self.extract_semantic_relations_from_descriptions()
+        relations.extend(description_relations)
         
         self.table_relations = relations
         print(f"🔗 관계 추출 완료: {len(relations)}개 관계")
         
         for rel in relations:
             print(f"  {rel.from_table}.{rel.from_column} → {rel.to_table}.{rel.to_column} ({rel.relation_type}, {rel.confidence})")
+        
+        return relations
+    
+    def extract_semantic_relations_from_descriptions(self) -> List[TableRelation]:
+        """Neo4j에 저장된 테이블 설명을 활용한 의미적 관계 추출"""
+        if not self.neo4j_driver:
+            print("⚠️ Neo4j 연결이 없어 테이블 설명 기반 관계 추출을 건너뜁니다.")
+            return []
+        
+        print("🧠 Neo4j 테이블 설명을 활용한 의미적 관계 분석 중...")
+        
+        # Neo4j에서 모든 테이블의 설명 정보 가져오기
+        table_descriptions = self.get_table_descriptions_from_neo4j()
+        
+        if len(table_descriptions) < 2:
+            print("⚠️ 충분한 테이블 설명이 없어 의미적 관계 추출을 건너뜁니다.")
+            return []
+        
+        # LLM을 활용하여 테이블 간 의미적 관계 분석
+        semantic_relations = self.analyze_semantic_relationships_with_llm(table_descriptions)
+        
+        return semantic_relations
+    
+    def get_table_descriptions_from_neo4j(self) -> Dict[str, str]:
+        """Neo4j에서 모든 테이블의 설명 정보 조회"""
+        table_descriptions = {}
+        
+        try:
+            with self.neo4j_driver.session() as session:
+                query = """
+                MATCH (t:Table)
+                RETURN t.name as table_name, t.comment as description
+                ORDER BY t.name
+                """
+                
+                result = session.run(query)
+                for record in result:
+                    table_name = record['table_name']
+                    description = record['description']
+                    if description:  # 설명이 있는 테이블만
+                        table_descriptions[table_name] = description
+                
+                print(f"📋 Neo4j에서 {len(table_descriptions)}개 테이블 설명 조회")
+                
+        except Exception as e:
+            print(f"❌ Neo4j에서 테이블 설명 조회 실패: {e}")
+        
+        return table_descriptions
+    
+    def analyze_semantic_relationships_with_llm(self, table_descriptions: Dict[str, str]) -> List[TableRelation]:
+        """LLM을 활용하여 테이블 설명 간 의미적 관계 분석"""
+        relations = []
+        
+        # 테이블 설명 정보를 프롬프트용으로 정리
+        descriptions_text = "데이터베이스 테이블 설명:\n"
+        for table, desc in table_descriptions.items():
+            descriptions_text += f"- {table}: {desc}\n"
+        
+        # LLM 타입에 따른 최적화된 프롬프트 생성
+        if self.llm_type == "claude":
+            prompt = f"""{descriptions_text}
+
+위의 테이블 설명들을 분석하여 테이블 간 의미적 관계를 찾아주세요.
+
+분석 기준:
+1. 비즈니스 로직상 밀접한 관련이 있는 테이블들
+2. 데이터 흐름상 연결되어야 하는 테이블들  
+3. 일반적으로 함께 조회되는 테이블들
+4. 부모-자식 관계나 주체-객체 관계
+
+각 관계에 대해 다음 정보를 제공해주세요:
+- 관련 테이블 쌍
+- 관계의 이유/설명
+- 관계 강도 (0.1~0.9, 높을수록 강한 관계)
+
+응답은 반드시 다음 JSON 형식으로만 반환해주세요:
+{{
+  "relationships": [
+    {{
+      "table1": "테이블명1",
+      "table2": "테이블명2", 
+      "reason": "관계 설명",
+      "confidence": 0.8
+    }}
+  ]
+}}"""
+        else:
+            prompt = f"""{descriptions_text}
+
+위의 테이블 설명을 분석하여 테이블 간 의미적 관계를 찾아주세요.
+
+기준:
+1. 비즈니스 로직상 관련 있는 테이블
+2. 데이터 흐름상 연결되는 테이블
+3. 함께 조회되는 테이블들
+
+JSON 형식으로 응답:
+{{
+  "relationships": [
+    {{
+      "table1": "테이블명1",
+      "table2": "테이블명2",
+      "reason": "관계 설명", 
+      "confidence": 0.8
+    }}
+  ]
+}}
+
+JSON:"""
+        
+        # LLM 호출
+        response = self.call_llm(prompt)
+        
+        if response:
+            try:
+                import json
+                
+                # JSON 블록 추출
+                response_clean = response.strip()
+                json_start = response_clean.find('{')
+                json_end = response_clean.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_clean[json_start:json_end]
+                    result = json.loads(json_str)
+                    
+                    if 'relationships' in result:
+                        for rel_data in result['relationships']:
+                            table1 = rel_data.get('table1', '')
+                            table2 = rel_data.get('table2', '')
+                            reason = rel_data.get('reason', '')
+                            confidence = float(rel_data.get('confidence', 0.5))
+                            
+                            # 유효한 테이블인지 확인
+                            if (table1 in self.table_schemas and 
+                                table2 in self.table_schemas and 
+                                table1 != table2):
+                                
+                                # 이미 존재하는 관계인지 확인
+                                existing = any(
+                                    (r.from_table == table1 and r.to_table == table2) or
+                                    (r.from_table == table2 and r.to_table == table1)
+                                    for r in self.table_relations
+                                )
+                                
+                                if not existing:
+                                    # 양방향 관계로 추가 (설명 기반이므로 특정 컬럼 없음)
+                                    relations.append(TableRelation(
+                                        from_table=table1,
+                                        from_column='',  # 설명 기반이므로 특정 컬럼 없음
+                                        to_table=table2,
+                                        to_column='',
+                                        relation_type='description_semantic',
+                                        confidence=min(confidence, 0.9)  # 최대 0.9로 제한
+                                    ))
+                                    
+                                    print(f"  📝 발견된 의미적 관계: {table1} ↔ {table2} ({reason}) [신뢰도: {confidence}]")
+                        
+                        print(f"✅ 설명 기반 의미적 관계 {len(relations)}개 추출 완료")
+                        
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                print(f"⚠️ LLM 응답 파싱 실패: {e}")
+                print(f"📄 원본 응답: {response[:200]}...")
         
         return relations
     
@@ -683,22 +801,82 @@ class HybridQueryGenerator:
                     col_type=col['type'], nullable=col['nullable'],
                     auto_increment=col.get('auto_increment', False))
             
-            # 관계 생성
+            # 관계 생성 (다양한 관계 타입 지원)
             for rel in self.table_relations:
-                session.run("""
-                    MATCH (from_table:Table {name: $from_table})
-                    MATCH (to_table:Table {name: $to_table})
-                    CREATE (from_table)-[:REFERENCES {
-                        from_column: $from_column,
-                        to_column: $to_column,
-                        relation_type: $relation_type,
-                        confidence: $confidence
-                    }]->(to_table)
-                """, from_table=rel.from_table, to_table=rel.to_table,
-                from_column=rel.from_column, to_column=rel.to_column,
-                relation_type=rel.relation_type, confidence=rel.confidence)
+                # 관계 타입에 따라 다른 Neo4j 관계 생성
+                if rel.relation_type == 'description_semantic':
+                    # 의미적 관계는 양방향으로 생성 (두 개의 방향 관계로)
+                    session.run("""
+                        MATCH (table1:Table {name: $from_table})
+                        MATCH (table2:Table {name: $to_table})
+                        CREATE (table1)-[:SEMANTIC_RELATION {
+                            relation_type: $relation_type,
+                            confidence: $confidence,
+                            description: 'LLM analyzed semantic relationship based on table descriptions'
+                        }]->(table2)
+                    """, from_table=rel.from_table, to_table=rel.to_table,
+                    relation_type=rel.relation_type, confidence=rel.confidence)
+                    
+                    # 반대 방향 관계도 생성
+                    session.run("""
+                        MATCH (table1:Table {name: $from_table})
+                        MATCH (table2:Table {name: $to_table})
+                        CREATE (table2)-[:SEMANTIC_RELATION {
+                            relation_type: $relation_type,
+                            confidence: $confidence,
+                            description: 'LLM analyzed semantic relationship based on table descriptions'
+                        }]->(table1)
+                    """, from_table=rel.from_table, to_table=rel.to_table,
+                    relation_type=rel.relation_type, confidence=rel.confidence)
+                else:
+                    # 기존 방식 (FK, 네이밍 패턴 등)
+                    session.run("""
+                        MATCH (from_table:Table {name: $from_table})
+                        MATCH (to_table:Table {name: $to_table})
+                        CREATE (from_table)-[:REFERENCES {
+                            from_column: $from_column,
+                            to_column: $to_column,
+                            relation_type: $relation_type,
+                            confidence: $confidence
+                        }]->(to_table)
+                    """, from_table=rel.from_table, to_table=rel.to_table,
+                    from_column=rel.from_column, to_column=rel.to_column,
+                    relation_type=rel.relation_type, confidence=rel.confidence)
         
         print("✅ Neo4j 스키마 그래프 생성 완료!")
+    
+    def get_semantic_relations_from_neo4j(self) -> List[Dict]:
+        """Neo4j에서 의미적 관계 정보 조회"""
+        if not self.neo4j_driver:
+            return []
+        
+        semantic_relations = []
+        
+        try:
+            with self.neo4j_driver.session() as session:
+                query = """
+                MATCH (t1:Table)-[r:SEMANTIC_RELATION]-(t2:Table)
+                WHERE t1.name < t2.name
+                RETURN t1.name as table1, t2.name as table2, 
+                       r.confidence as confidence, r.relation_type as relation_type
+                ORDER BY r.confidence DESC
+                """
+                
+                result = session.run(query)
+                for record in result:
+                    semantic_relations.append({
+                        'table1': record['table1'],
+                        'table2': record['table2'],
+                        'confidence': record['confidence'],
+                        'relation_type': record['relation_type']
+                    })
+                
+                print(f"📋 Neo4j에서 {len(semantic_relations)}개 의미적 관계 조회")
+                
+        except Exception as e:
+            print(f"❌ Neo4j에서 의미적 관계 조회 실패: {e}")
+        
+        return semantic_relations
     
     def query_relationship_paths(self, start_table: str, end_table: str = None, max_depth: int = 3) -> List[Dict]:
         """Neo4j에서 테이블 간 관계 경로 조회"""
@@ -835,18 +1013,19 @@ JSON:"""
                     print(f"⚠️ LLM 응답 파싱 실패: {e}")
                     selected_tables = []
             
-            # 2단계: 그래프 기반 연관 테이블 확장
+            # 2단계: 그래프 기반 연관 테이블 확장 (의미적 관계 포함)
             if selected_tables:
                 print("🔗 그래프에서 연관 테이블 자동 확장 중...")
                 
-                # 선택된 테이블들과 연결된 테이블 찾기
+                # 2-1. 기존 FK/참조 관계로 연결된 테이블 찾기
                 expand_query = """
                 MATCH (selected:Table)-[:REFERENCES*1..2]-(related:Table)
                 WHERE selected.name IN $selected_tables 
                   AND NOT related.name IN $selected_tables
                 RETURN DISTINCT related.name as related_table, 
                        related.comment as comment,
-                       shortestPath((selected)-[:REFERENCES*1..2]-(related)) as path
+                       shortestPath((selected)-[:REFERENCES*1..2]-(related)) as path,
+                       'reference' as relation_source
                 ORDER BY length(path), related_table
                 LIMIT 3
                 """
@@ -861,7 +1040,29 @@ JSON:"""
                     # 관계 거리가 가까운 중요한 테이블만 추가
                     if path_length <= 2:
                         selected_tables.append(related_table)
-                        print(f"  + {related_table}: {comment} (거리: {path_length})")
+                        print(f"  + {related_table}: {comment} (FK 거리: {path_length})")
+                
+                # 2-2. 의미적 관계로 연결된 테이블 찾기
+                semantic_query = """
+                MATCH (selected:Table)-[:SEMANTIC_RELATION]-(related:Table)
+                WHERE selected.name IN $selected_tables 
+                  AND NOT related.name IN $selected_tables
+                RETURN DISTINCT related.name as related_table, 
+                       related.comment as comment,
+                       'semantic' as relation_source
+                ORDER BY related_table
+                LIMIT 2
+                """
+                
+                semantic_results = session.run(semantic_query, selected_tables=selected_tables)
+                
+                for record in semantic_results:
+                    related_table = record['related_table']
+                    comment = record['comment']
+                    
+                    if related_table not in selected_tables:
+                        selected_tables.append(related_table)
+                        print(f"  + {related_table}: {comment} (의미적 관계)")
             
             # 3단계: 폴백 - LLM 분석이 실패한 경우
             if not selected_tables:
@@ -986,25 +1187,155 @@ JSON:"""
             return []
     
     def generate_schema_prompt(self) -> str:
-        """테이블 스키마 정보를 LLM 프롬프트용으로 변환"""
-        prompt = "다음은 데이터베이스의 테이블 스키마 정보입니다:\n\n"
+        """테이블 스키마 정보를 LLM 프롬프트용으로 변환 (정확한 컬럼 정보 포함)"""
+        prompt = "다음은 데이터베이스의 정확한 테이블 스키마 정보입니다:\n\n"
         
         for table_name, info in self.tables_info.items():
-            prompt += f"테이블: {table_name}\n"
-            prompt += "컬럼:\n"
+            # 테이블 설명 추가
+            table_schema = self.table_schemas.get(table_name)
+            table_comment = table_schema.comment if table_schema else ""
             
+            prompt += f"📋 테이블: {table_name}\n"
+            if table_comment:
+                prompt += f"   설명: {table_comment}\n"
+            
+            prompt += "   컬럼 정보:\n"
+            
+            # 실제 데이터베이스에서 조회한 컬럼 정보 사용
             for col in info['columns']:
-                col_name, col_type = col[0], col[1]
-                prompt += f"  - {col_name}: {col_type}\n"
+                col_name, col_type, null_allowed = col[0], col[1], col[2]
+                col_key = col[3] if len(col) > 3 else ""
+                col_default = col[4] if len(col) > 4 else ""
+                col_extra = col[5] if len(col) > 5 else ""
+                
+                # 컬럼 설명 생성
+                col_desc = f"  - {col_name}: {col_type}"
+                
+                if col_key == "PRI":
+                    col_desc += " (기본키)"
+                elif col_key == "MUL":
+                    col_desc += " (외래키)"
+                
+                if null_allowed == "NO":
+                    col_desc += " NOT NULL"
+                
+                if col_extra == "auto_increment":
+                    col_desc += " AUTO_INCREMENT"
+                
+                prompt += col_desc + "\n"
             
+            # Foreign Key 관계 정보 추가
+            if table_schema and table_schema.foreign_keys:
+                prompt += "   외래키 관계:\n"
+                for fk in table_schema.foreign_keys:
+                    prompt += f"     - {fk['from_column']} → {fk['to_table']}.{fk['to_column']}\n"
+            
+            # 샘플 데이터 (컬럼명과 함께)
             if info['sample_data']:
-                prompt += "샘플 데이터:\n"
+                prompt += "   샘플 데이터:\n"
+                col_names = [col[0] for col in info['columns']]
+                prompt += f"     컬럼: {', '.join(col_names)}\n"
                 for i, row in enumerate(info['sample_data'][:2], 1):
-                    prompt += f"  {i}: {row}\n"
+                    prompt += f"     {i}: {row}\n"
             
             prompt += "\n"
         
+        # 중요한 주의사항 추가
+        prompt += "⚠️ 중요: 쿼리 작성 시 반드시 위에 명시된 정확한 컬럼명을 사용하세요.\n"
+        prompt += "테이블별 컬럼 구조를 정확히 확인하고 존재하지 않는 컬럼을 참조하지 마세요.\n\n"
+        
         return prompt
+    
+    def validate_sql_query(self, query: str) -> Tuple[bool, List[str]]:
+        """생성된 SQL 쿼리의 기본적인 검증"""
+        errors = []
+        
+        try:
+            # 기본적인 구문 검증
+            query_upper = query.upper()
+            
+            # 1. SELECT 문인지 확인
+            if not query_upper.strip().startswith('SELECT'):
+                errors.append("쿼리는 SELECT 문으로 시작해야 합니다.")
+            
+            # 2. 테이블명 검증
+            available_tables = set(self.tables_info.keys())
+            
+            # FROM, JOIN 절에서 테이블명과 별칭 추출
+            import re
+            table_pattern = r'(?:FROM|JOIN)\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?'
+            found_tables = re.findall(table_pattern, query, re.IGNORECASE)
+            
+            # 테이블 별칭 매핑 생성
+            table_aliases = {}
+            for table, alias in found_tables:
+                actual_table = None
+                table_lower = table.lower()
+                
+                # 실제 테이블 찾기
+                if table_lower in [t.lower() for t in available_tables]:
+                    actual_table = table
+                
+                if not actual_table:
+                    errors.append(f"존재하지 않는 테이블: {table}")
+                    continue
+                
+                # 별칭 저장 (별칭이 없으면 테이블명 자체를 별칭으로)
+                alias = alias.strip() if alias else table
+                table_aliases[alias.lower()] = actual_table
+            
+            # 3. 컬럼 참조 검증 (더 정확한 검증)
+            # 모든 컬럼 참조 추출 (SELECT, WHERE, GROUP BY, ORDER BY 등)
+            column_pattern = r'(?:SELECT|WHERE|GROUP\s+BY|ORDER\s+BY|ON)\s+(?:.*?[^.\w])(\w+)\.(\w+)(?=[^.\w]|$)'
+            column_refs = re.findall(column_pattern, query, re.IGNORECASE)
+            
+            for alias, column in column_refs:
+                alias_lower = alias.lower()
+                if alias_lower not in table_aliases:
+                    errors.append(f"정의되지 않은 테이블 별칭: {alias}")
+                    continue
+                
+                actual_table = table_aliases[alias_lower]
+                available_columns = [col[0].lower() for col in self.tables_info[actual_table]['columns']]
+                
+                if column.lower() not in available_columns:
+                    errors.append(f"테이블 {actual_table}에 존재하지 않는 컬럼: {column}")
+            
+            # 4. JOIN 조건 검증
+            join_pattern = r'JOIN\s+\w+(?:\s+(?:AS\s+)?\w+)?\s+ON\s+([^()]+?)(?=\s+(?:WHERE|GROUP|ORDER|LIMIT|$))'
+            join_conditions = re.findall(join_pattern, query, re.IGNORECASE)
+            
+            for condition in join_conditions:
+                # 조인 조건의 양쪽 컬럼 추출 (a.id = b.user_id 형태)
+                parts = condition.split('=')
+                if len(parts) != 2:
+                    errors.append(f"잘못된 JOIN 조건: {condition}")
+                    continue
+                
+                for part in parts:
+                    col_ref = part.strip().split('.')
+                    if len(col_ref) != 2:
+                        errors.append(f"잘못된 컬럼 참조: {part.strip()}")
+                        continue
+                    
+                    alias, column = col_ref
+                    alias_lower = alias.lower()
+                    if alias_lower not in table_aliases:
+                        errors.append(f"JOIN 조건에서 정의되지 않은 테이블 별칭: {alias}")
+                        continue
+                    
+                    actual_table = table_aliases[alias_lower]
+                    available_columns = [col[0].lower() for col in self.tables_info[actual_table]['columns']]
+                    if column.lower() not in available_columns:
+                        errors.append(f"JOIN 조건에서 테이블 {actual_table}에 존재하지 않는 컬럼: {column}")
+            
+        except Exception as e:
+            errors.append(f"쿼리 검증 중 오류 발생: {str(e)}")
+            import traceback
+            print("💡 검증 오류 상세:")
+            print(traceback.format_exc())
+        
+        return len(errors) == 0, errors
     
     def generate_hybrid_sql_query(self, user_request: str) -> Optional[str]:
         """Neo4j 그래프 정보를 활용한 하이브리드 SQL 쿼리 생성"""
@@ -1046,7 +1377,63 @@ JSON:"""
                 sql_query = ' '.join(sql_lines)
                 if not sql_query.endswith(';'):
                     sql_query += ';'
-                return sql_query
+                
+                # 쿼리 검증
+                print("\n🔍 생성된 SQL 쿼리 검증 중...")
+                is_valid, errors = self.validate_sql_query(sql_query)
+                
+                if not is_valid:
+                    print("❌ SQL 쿼리 검증 실패:")
+                    for error in errors:
+                        print(f"  - {error}")
+                    
+                    # 오류 정보를 포함하여 LLM에게 재시도 요청
+                    retry_prompt = f"""{enhanced_prompt}
+
+이전 시도에서 다음 오류가 발생했습니다:
+{chr(10).join(f'- {error}' for error in errors)}
+
+위 오류를 수정하여 올바른 SQL 쿼리를 생성해주세요.
+특히 테이블과 컬럼명을 정확하게 사용해야 합니다.
+
+SQL 쿼리:"""
+                    
+                    print("\n🔄 쿼리 재생성 시도 중...")
+                    response = self.call_llm(retry_prompt)
+                    
+                    if response:
+                        # 재시도 쿼리 추출
+                        lines = response.split('\n')
+                        sql_lines = []
+                        in_sql = False
+                        
+                        for line in lines:
+                            line = line.strip()
+                            if line.upper().startswith('SELECT'):
+                                in_sql = True
+                            if in_sql:
+                                sql_lines.append(line)
+                                if line.endswith(';'):
+                                    break
+                        
+                        if sql_lines:
+                            sql_query = ' '.join(sql_lines)
+                            if not sql_query.endswith(';'):
+                                sql_query += ';'
+                            
+                            # 재검증
+                            is_valid, errors = self.validate_sql_query(sql_query)
+                            if is_valid:
+                                print("✅ 수정된 쿼리 검증 성공")
+                                return sql_query
+                            else:
+                                print("❌ 수정된 쿼리도 검증 실패:")
+                                for error in errors:
+                                    print(f"  - {error}")
+                                return None
+                else:
+                    print("✅ SQL 쿼리 검증 성공")
+                    return sql_query
         
         return None
     
@@ -1145,34 +1532,85 @@ JSON:"""
                 print(f"⚠️  LLM 응답 파싱 실패: {e}")
                 print(f"📄 원본 응답: {response[:200]}...")
         
-        # LLM 분석 실패시 키워드 기반 방식으로 폴백
-        print("🔄 키워드 기반 방식으로 폴백...")
+        # LLM 분석 실패시 다른 LLM 기반 방식으로 폴백
+        print("🔄 LLM 기반 폴백 방식으로 재시도...")
         return self.extract_relevant_tables_fallback(user_request)
     
     def extract_relevant_tables_fallback(self, user_request: str) -> List[str]:
-        """키워드 기반 폴백 방식"""
-        request_lower = user_request.lower()
-        relevant_tables = []
+        """LLM 기반 순수 의미적 분석 폴백 방식"""
+        print("🧠 LLM 기반 의미적 분석으로 테이블 선택 중...")
         
-        # 키워드 기반 테이블 매칭
-        table_keywords = {
-            'users': ['사용자', '유저', '고객', '회원', '사람'],
-            'products': ['상품', '제품', '아이템', '물건'],
-            'orders': ['주문', '구매', '결제'],
-            'order_items': ['주문상세', '주문내역', '구매내역'],
-            'categories': ['카테고리', '분류', '종류'],
-            'reviews': ['리뷰', '평점', '평가', '후기']
-        }
+        # 모든 테이블의 설명 정보 수집
+        table_descriptions = {}
+        for table_name, schema in self.table_schemas.items():
+            table_descriptions[table_name] = schema.comment
         
-        for table, keywords in table_keywords.items():
-            if any(keyword in request_lower for keyword in keywords):
-                relevant_tables.append(table)
+        # 테이블 설명 정보를 프롬프트용으로 정리
+        descriptions_text = "데이터베이스 테이블 목록:\n"
+        for table, desc in table_descriptions.items():
+            descriptions_text += f"- {table}: {desc}\n"
         
-        # 기본적으로 관련성이 높은 테이블들 추가
-        if not relevant_tables:
-            relevant_tables = ['users', 'products', 'orders']
+        # LLM을 활용한 테이블 선택
+        if self.llm_type == "claude":
+            prompt = f"""{descriptions_text}
+
+사용자 요청: "{user_request}"
+
+위의 테이블 설명을 바탕으로 사용자 요청을 처리하는데 필요한 테이블들을 선택해주세요.
+
+분석 기준:
+1. 사용자가 원하는 정보와 직접 관련된 테이블
+2. 데이터 조회나 분석에 필요한 테이블
+3. 비즈니스 로직상 연관된 테이블
+
+응답은 반드시 JSON 형식으로만 반환해주세요:
+{{"tables": ["table1", "table2"], "reason": "선택 이유"}}"""
+        else:
+            prompt = f"""{descriptions_text}
+
+사용자 요청: {user_request}
+
+위 테이블들 중에서 사용자 요청에 필요한 테이블을 선택하여 JSON으로 반환해주세요.
+
+JSON:
+{{"tables": ["테이블명1", "테이블명2"], "reason": "선택 이유"}}
+
+JSON:"""
         
-        return relevant_tables
+        response = self.call_llm(prompt)
+        selected_tables = []
+        
+        if response:
+            try:
+                import json
+                response_clean = response.strip()
+                json_start = response_clean.find('{')
+                json_end = response_clean.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_clean[json_start:json_end]
+                    result = json.loads(json_str)
+                    
+                    if 'tables' in result and isinstance(result['tables'], list):
+                        # 유효한 테이블만 필터링
+                        selected_tables = [
+                            table for table in result['tables'] 
+                            if table in self.table_schemas
+                        ]
+                        
+                        if selected_tables:
+                            print(f"🎯 LLM 폴백 분석 결과: {selected_tables}")
+                            if 'reason' in result:
+                                print(f"📝 선택 이유: {result['reason']}")
+                            return selected_tables
+                        
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"⚠️ LLM 폴백 응답 파싱 실패: {e}")
+        
+        # 최종 폴백: 가장 중심적인 테이블들 반환
+        print("⚠️ LLM 분석 실패. 중심성 높은 테이블들로 폴백...")
+        core_tables = list(self.table_schemas.keys())[:3]  # 처음 3개 테이블
+        return core_tables
     
     def extract_relevant_tables(self, user_request: str) -> List[str]:
         """사용자 요청에서 관련 테이블 추출 (그래프 기반 검색)"""
@@ -1183,8 +1621,15 @@ JSON:"""
         """Neo4j 정보를 활용한 향상된 프롬프트 생성"""
         schema_info = self.generate_schema_prompt()
         
+        # 테이블 별칭 규칙 추가
+        alias_info = "테이블 별칭 규칙:\n"
+        for table in relevant_tables:
+            # 첫 글자를 별칭으로 사용하되, 중복을 피함
+            base_alias = table[0].lower()
+            alias_info += f"- {table} AS {base_alias} (예: {base_alias}.column_name)\n"
+        
         # 조인 정보 생성
-        join_info = "최적 조인 순서 및 관계:\n"
+        join_info = "\n최적 조인 순서 및 관계:\n"
         for i, seq in enumerate(join_sequence):
             table = seq['table']
             joins = seq['joins']
@@ -1192,6 +1637,30 @@ JSON:"""
             join_info += f"{i+1}. {table}\n"
             for join in joins:
                 join_info += f"   └─ {join['from_table']}.{join['from_column']} = {join['to_table']}.{join['to_column']} (신뢰도: {join['confidence']})\n"
+        
+        # 테이블별 필수 컬럼 정보 추가
+        column_info = "\n테이블별 주요 컬럼 (정확한 이름 사용 필수):\n"
+        for table in relevant_tables:
+            if table in self.tables_info:
+                info = self.tables_info[table]
+                column_info += f"\n{table} 테이블:\n"
+                for col in info['columns']:
+                    col_name, col_type = col[0], col[1]
+                    # 컬럼 타입에 따른 사용법 힌트 추가
+                    usage_hint = ""
+                    if "INT" in col_type.upper():
+                        usage_hint = "숫자 연산/비교 가능"
+                    elif "DECIMAL" in col_type.upper():
+                        usage_hint = "소수점 연산 가능"
+                    elif "DATE" in col_type.upper() or "TIMESTAMP" in col_type.upper():
+                        usage_hint = "날짜/시간 함수 사용 가능"
+                    elif "ENUM" in col_type.upper():
+                        usage_hint = f"가능한 값: {col_type}"
+                    
+                    column_info += f"  - {col_name}: {col_type}"
+                    if usage_hint:
+                        column_info += f" ({usage_hint})"
+                    column_info += "\n"
         
         # 관련 테이블의 상세 정보
         table_details = "\n관련 테이블 상세 정보:\n"
@@ -1347,26 +1816,164 @@ SQL 쿼리:"""
         return None
     
     def execute_query(self, query: str) -> Optional[List[tuple]]:
-        """생성된 SQL 쿼리 실행"""
+        """생성된 SQL 쿼리 실행 (검증 포함)"""
         try:
+            # 실행 전 쿼리 검증
+            is_valid, errors = self.validate_sql_query(query)
+            if not is_valid:
+                print("❌ SQL 쿼리 검증 실패:")
+                for error in errors:
+                    print(f"  - {error}")
+                return None
+            
+            # 쿼리 실행 전 디버깅 정보 출력
+            print("\n🔍 실행할 SQL 쿼리:")
+            print(f"```sql\n{query}\n```")
+            
+            # 테이블 정보 출력
+            print("\n📋 관련 테이블 정보:")
+            import re
+            table_pattern = r'(?:FROM|JOIN)\s+(\w+)'
+            found_tables = re.findall(table_pattern, query, re.IGNORECASE)
+            
+            for table in found_tables:
+                if table in self.tables_info:
+                    info = self.tables_info[table]
+                    print(f"\n테이블: {table}")
+                    print("컬럼:")
+                    for col in info['columns']:
+                        col_name, col_type = col[0], col[1]
+                        print(f"  - {col_name}: {col_type}")
+            
+            # 쿼리 실행
             with self.connection.cursor() as cursor:
+                print("\n⚡ 쿼리 실행 중...")
                 cursor.execute(query)
                 results = cursor.fetchall()
+                print("✅ 쿼리 실행 성공")
                 return results
+                
         except Exception as e:
             print(f"❌ 쿼리 실행 실패: {e}")
+            print("💡 오류 상세:")
+            import traceback
+            print(traceback.format_exc())
             return None
     
     def run_interactive_mode(self):
         """대화형 모드 실행"""
-        print("=" * 70)
-        print("🚀 하이브리드 SQL 쿼리 생성기 시작 (MariaDB + Neo4j)")
-        print(f"🤖 사용 중인 LLM: {self.llm_type.upper()}")
-        if self.llm_type == "claude":
-            print(f"📋 모델: {self.claude_model}")
-        else:
-            print(f"📋 모델: {self.model_name}")
-        print("=" * 70)
+        try:
+            print("=" * 70)
+            print("🚀 하이브리드 SQL 쿼리 생성기 시작 (MariaDB + Neo4j)")
+            print(f"🤖 사용 중인 LLM: {self.llm_type.upper()}")
+            if self.llm_type == "claude":
+                print(f"📋 모델: {self.claude_model}")
+            else:
+                print(f"📋 모델: {self.model_name}")
+            print("=" * 70)
+            
+            # MariaDB 연결 확인
+            if not self.connect_to_database():
+                return
+            
+            # LLM 연결 및 모델 확인
+            if self.llm_type == "ollama":
+                if not self.check_ollama_connection():
+                    return
+                
+                if not self.check_model_availability():
+                    print("\n💡 OLLAMA 모델을 먼저 설치해주세요:")
+                    print(f"ollama pull {self.model_name}")
+                    return
+            elif self.llm_type == "claude":
+                if not self.check_model_availability():
+                    print("\n💡 Claude API 설정을 확인해주세요:")
+                    print("1. ANTHROPIC_API_KEY 환경변수 설정")
+                    print("2. anthropic 라이브러리 설치: pip install anthropic")
+                    return
+            
+            # 테이블 분석
+            self.analyze_all_tables()
+            
+            if not self.tables_info:
+                print("❌ 분석할 테이블이 없습니다.")
+                return
+            
+            # Neo4j 연결 및 스키마 그래프 생성
+            neo4j_available = self.connect_to_neo4j()
+            
+            if neo4j_available:
+                print("\n🔄 스키마 그래프 분석 중...")
+                self.extract_schema_from_ddl()
+                self.extract_table_relations()
+                self.create_schema_graph_in_neo4j()
+                print("✅ 하이브리드 모드 활성화! (Neo4j 그래프 분석 사용)")
+            else:
+                print("⚠️  기본 모드로 실행 (Neo4j 없이)")
+            
+            print("\n" + "=" * 60)
+            print("🎯 대화형 SQL 쿼리 생성 모드")
+            print("종료하려면 'quit' 또는 'exit'를 입력하세요")
+            print("=" * 60)
+            
+            while True:
+                try:
+                    user_input = input("\n📝 검색하고 싶은 내용을 설명해주세요: ").strip()
+                    
+                    if user_input.lower() in ['quit', 'exit', '종료']:
+                        break
+                    
+                    if not user_input:
+                        continue
+                    
+                    # SQL 쿼리 생성 (하이브리드 모드 우선)
+                    if neo4j_available:
+                        generated_query = self.generate_hybrid_sql_query(user_input)
+                    else:
+                        generated_query = self.generate_sql_query(user_input)
+                    
+                    if generated_query:
+                        print(f"\n✨ 생성된 SQL 쿼리:")
+                        print(f"```sql\n{generated_query}\n```")
+                        
+                        # 쿼리 실행 여부 확인
+                        execute = input("\n실행하시겠습니까? (y/n): ").strip().lower()
+                        
+                        if execute in ['y', 'yes', 'ㅇ']:
+                            results = self.execute_query(generated_query)
+                            
+                            if results is not None:
+                                print(f"\n📊 실행 결과 ({len(results)}개 행):")
+                                
+                                if results:
+                                    for i, row in enumerate(results[:10], 1):  # 최대 10개만 표시
+                                        print(f"  {i}: {row}")
+                                    
+                                    if len(results) > 10:
+                                        print(f"  ... 및 {len(results) - 10}개 행 더")
+                                else:
+                                    print("  결과가 없습니다.")
+                    else:
+                        print("❌ SQL 쿼리 생성에 실패했습니다.")
+                        
+                except KeyboardInterrupt:
+                    print("\n\n👋 프로그램을 종료합니다.")
+                    break
+                except Exception as e:
+                    print(f"❌ 오류 발생: {e}")
+                    import traceback
+                    print("💡 오류 상세:")
+                    print(traceback.format_exc())
+            
+            self.disconnect_from_database()
+            print("🏁 프로그램이 종료되었습니다.")
+            
+        except Exception as e:
+            print(f"❌ 프로그램 실행 중 오류 발생: {e}")
+            import traceback
+            print("💡 오류 상세:")
+            print(traceback.format_exc())
+            self.disconnect_from_database()
         
         # MariaDB 연결 확인
         if not self.connect_to_database():
