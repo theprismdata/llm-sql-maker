@@ -1524,21 +1524,104 @@ JSON:"""
         return []
     
     def find_target_columns(self, user_request: str, tables: List[str]) -> Dict[str, List[str]]:
-        """단계 2: CodeLlama를 사용하여 Neo4j에서 필요한 컬럼 검색"""
-        tables_str = ", ".join(tables)
-        prompt = f"""다음 요청을 처리하는데 필요한 컬럼들을 Neo4j에서 검색해주세요:
+        """단계 2: Neo4j에서 실제 컬럼 메타데이터를 조회하여 필요한 컬럼 검색"""
+        if not self.neo4j_driver:
+            print("❌ Neo4j 연결이 없어 기본 컬럼 검색으로 폴백합니다.")
+            return self._fallback_column_search(user_request, tables)
+        
+        print("🔍 Neo4j에서 실제 컬럼 메타데이터 조회 중...")
+        
+        # 1단계: Neo4j에서 각 테이블의 실제 컬럼 정보 조회
+        table_columns_metadata = {}
+        
+        try:
+            with self.neo4j_driver.session() as session:
+                for table in tables:
+                    query = """
+                    MATCH (t:Table {name: $table_name})-[:HAS_COLUMN]->(c:Column)
+                    RETURN c.name as column_name, 
+                           c.type as column_type, 
+                           c.nullable as nullable,
+                           c.auto_increment as auto_increment
+                    ORDER BY c.name
+                    """
+                    
+                    result = session.run(query, table_name=table)
+                    columns_info = []
+                    
+                    for record in result:
+                        column_info = {
+                            'name': record['column_name'],
+                            'type': record['column_type'], 
+                            'nullable': record.get('nullable', True),
+                            'auto_increment': record.get('auto_increment', False)
+                        }
+                        columns_info.append(column_info)
+                    
+                    if columns_info:
+                        table_columns_metadata[table] = columns_info
+                        print(f"  📋 {table}: {len(columns_info)}개 컬럼 조회")
+                    else:
+                        print(f"  ⚠️ {table}: Neo4j에 컬럼 정보 없음, 직접 DB 조회")
+                        # Neo4j에 컬럼 정보가 없으면 직접 DB에서 조회
+                        db_columns = self._get_columns_from_db(table)
+                        if db_columns:
+                            table_columns_metadata[table] = db_columns
+        
+        except Exception as e:
+            print(f"❌ Neo4j 컬럼 조회 실패: {e}")
+            return self._fallback_column_search(user_request, tables)
+        
+        if not table_columns_metadata:
+            print("⚠️ 조회된 컬럼 정보가 없습니다.")
+            return self._fallback_column_search(user_request, tables)
+        
+        # 2단계: 컬럼 메타데이터를 포함한 프롬프트 생성
+        columns_info = "실제 테이블 컬럼 정보:\n"
+        for table, columns in table_columns_metadata.items():
+            columns_info += f"\n{table} 테이블:\n"
+            for col in columns:
+                col_desc = f"  - {col['name']} ({col['type']})"
+                if not col.get('nullable', True):
+                    col_desc += " NOT NULL"
+                if col.get('auto_increment', False):
+                    col_desc += " AUTO_INCREMENT"
+                columns_info += col_desc + "\n"
+        
+        # 3단계: LLM에게 실제 컬럼 정보를 제공하여 필요한 컬럼 선택 요청
+        if self.init_llm_type == "claude":
+            prompt = f"""{columns_info}
 
 사용자 요청: {user_request}
-대상 테이블: {tables_str}
 
-각 테이블에서 어떤 컬럼들이 필요한지 찾아주세요.
-응답은 JSON 형식으로 반환해주세요:
-{{"columns": {{"table1": ["col1", "col2"], "table2": ["col1", "col2"]}}}}"""
+위의 실제 컬럼 정보를 바탕으로 사용자 요청을 처리하는데 필요한 컬럼들을 선택해주세요.
 
+분석 기준:
+1. SELECT 절에 포함될 컬럼 (사용자가 조회하고자 하는 데이터)
+2. WHERE 절에 필요한 컬럼 (필터링 조건)
+3. JOIN 조건에 필요한 컬럼 (테이블 연결)
+4. GROUP BY, ORDER BY에 필요한 컬럼
+
+응답은 반드시 다음 JSON 형식으로만 반환해주세요:
+{{"columns": {{"table1": ["col1", "col2"], "table2": ["col1", "col2"]}}, "reason": "선택 이유"}}"""
+        else:
+            prompt = f"""{columns_info}
+
+사용자 요청: {user_request}
+
+위의 실제 컬럼 정보를 보고 필요한 컬럼들을 선택해주세요.
+
+JSON 형식으로 응답:
+{{"columns": {{"table1": ["col1", "col2"], "table2": ["col1", "col2"]}}, "reason": "선택 이유"}}
+
+JSON:"""
+        
         response = self.call_llm(prompt, stage="column_search")
         if not response:
-            return {}
+            print("❌ LLM 컬럼 분석 실패")
+            return self._auto_select_essential_columns(table_columns_metadata)
         
+        # 4단계: LLM 응답 파싱 및 검증
         try:
             import json
             response_clean = response.strip()
@@ -1548,9 +1631,125 @@ JSON:"""
             if json_start >= 0 and json_end > json_start:
                 json_str = response_clean[json_start:json_end]
                 result = json.loads(json_str)
-            return result.get('columns', {})
-        except:
-            return {}
+                
+                if 'columns' in result:
+                    selected_columns = result['columns']
+                    reason = result.get('reason', '')
+                    
+                    # 5단계: 선택된 컬럼이 실제로 존재하는지 검증
+                    validated_columns = {}
+                    for table, cols in selected_columns.items():
+                        if table in table_columns_metadata:
+                            available_columns = [col['name'] for col in table_columns_metadata[table]]
+                            valid_cols = [col for col in cols if col in available_columns]
+                            
+                            if valid_cols:
+                                validated_columns[table] = valid_cols
+                            else:
+                                print(f"⚠️ {table}: 선택된 컬럼 중 유효한 것이 없음, 필수 컬럼 자동 선택")
+                                validated_columns[table] = self._get_essential_columns(table_columns_metadata[table])
+                    
+                    if validated_columns:
+                        print(f"✅ 컬럼 선택 완료: {reason}")
+                        for table, cols in validated_columns.items():
+                            print(f"  - {table}: {', '.join(cols)}")
+                        return validated_columns
+                        
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠️ LLM 응답 파싱 실패: {e}")
+        
+        # 6단계: 모든 분석이 실패한 경우 필수 컬럼 자동 선택
+        print("🔄 자동 필수 컬럼 선택으로 폴백")
+        return self._auto_select_essential_columns(table_columns_metadata)
+    
+    def _get_columns_from_db(self, table_name: str) -> List[Dict]:
+        """데이터베이스에서 직접 컬럼 정보 조회 (Neo4j 정보가 없을 때)"""
+        try:
+            if table_name in self.tables_info:
+                db_columns = []
+                for col in self.tables_info[table_name]['columns']:
+                    col_name, col_type = col[0], col[1]
+                    null_allowed = col[2] if len(col) > 2 else "YES"
+                    col_extra = col[5] if len(col) > 5 else ""
+                    
+                    db_columns.append({
+                        'name': col_name,
+                        'type': col_type,
+                        'nullable': null_allowed == "YES",
+                        'auto_increment': 'auto_increment' in col_extra.lower()
+                    })
+                return db_columns
+        except Exception as e:
+            print(f"⚠️ DB에서 {table_name} 컬럼 조회 실패: {e}")
+        return []
+    
+    def _fallback_column_search(self, user_request: str, tables: List[str]) -> Dict[str, List[str]]:
+        """Neo4j 없이 기본 컬럼 검색 (기존 방식)"""
+        print("🔄 기본 컬럼 검색 방식으로 폴백")
+        
+        # 각 테이블의 주요 컬럼들을 자동 선택
+        result = {}
+        for table in tables:
+            if table in self.tables_info:
+                # ID 컬럼, name 컬럼, 주요 컬럼들 자동 선택
+                columns = [col[0] for col in self.tables_info[table]['columns']]
+                essential_cols = []
+                
+                for col in columns:
+                    col_lower = col.lower()
+                    if (col_lower.endswith('_id') or 
+                        'name' in col_lower or 
+                        col_lower in ['id', 'title', 'email', 'status', 'created_at']):
+                        essential_cols.append(col)
+                
+                if essential_cols:
+                    result[table] = essential_cols[:5]  # 최대 5개
+                else:
+                    result[table] = columns[:3]  # 처음 3개 컬럼
+        
+        return result
+    
+    def _auto_select_essential_columns(self, table_columns_metadata: Dict[str, List[Dict]]) -> Dict[str, List[str]]:
+        """테이블별 필수 컬럼 자동 선택"""
+        result = {}
+        
+        for table, columns in table_columns_metadata.items():
+            essential_cols = []
+            
+            # 우선순위별 컬럼 선택
+            for col in columns:
+                col_name = col['name'].lower()
+                
+                # 1순위: ID 컬럼 (PK, FK)
+                if col_name.endswith('_id') or col_name == 'id':
+                    essential_cols.append(col['name'])
+                # 2순위: 이름/제목 컬럼
+                elif 'name' in col_name or 'title' in col_name:
+                    essential_cols.append(col['name'])
+                # 3순위: 상태, 날짜 컬럼
+                elif col_name in ['status', 'email', 'created_at', 'updated_at']:
+                    essential_cols.append(col['name'])
+            
+            # 필수 컬럼이 없으면 처음 몇 개 선택
+            if not essential_cols:
+                essential_cols = [col['name'] for col in columns[:3]]
+            
+            result[table] = essential_cols[:5]  # 최대 5개로 제한
+            print(f"  🔧 {table}: 자동 선택된 컬럼 {essential_cols}")
+        
+        return result
+    
+    def _get_essential_columns(self, columns_metadata: List[Dict]) -> List[str]:
+        """단일 테이블의 필수 컬럼 추출"""
+        essential = []
+        
+        for col in columns_metadata:
+            col_name = col['name'].lower()
+            if (col_name.endswith('_id') or col_name == 'id' or 
+                'name' in col_name or col_name in ['status', 'email']):
+                essential.append(col['name'])
+        
+        return essential[:3] if essential else [col['name'] for col in columns_metadata[:2]]
     
     def validate_schema_elements(self, tables: List[str], columns: Dict[str, List[str]]) -> Tuple[bool, List[str]]:
         """단계 3: 검색된 테이블과 컬럼이 실제 스키마와 일치하는지 검증"""
@@ -1574,135 +1773,330 @@ JSON:"""
         return len(errors) == 0, errors
     
     def generate_final_query(self, user_request: str, tables: List[str], columns: Dict[str, List[str]]) -> Optional[str]:
-        """단계 4: CodeLlama를 사용하여 최종 SQL 쿼리 생성"""
-        # 테이블과 컬럼 정보 포맷팅
-        schema_info = []
-        for table in tables:
-            if table in self.tables_info:
-                cols = columns.get(table, [])
-                schema_info.append(f"{table} ({', '.join(cols)})")
+        """단계 4: CodeLlama를 사용하여 최종 SQL 쿼리 생성 (개선된 버전)"""
         
-        schema_str = "\n".join(schema_info)
+        # 상세한 스키마 정보 생성
+        detailed_schema = self._generate_detailed_schema_info(tables, columns)
         
-        prompt = f"""다음 정보를 바탕으로 SQL 쿼리를 생성해주세요:
+        # LLM 타입에 따른 최적화된 프롬프트 생성
+        if self.init_llm_type == "claude":
+            prompt = f"""{detailed_schema}
 
 사용자 요청: {user_request}
 
-사용할 테이블과 컬럼:
-{schema_str}
+위의 정확한 스키마 정보를 바탕으로 SQL 쿼리를 생성해주세요.
+
+중요한 규칙:
+1. 반드시 위에 명시된 정확한 컬럼명만 사용하세요
+2. ENUM 타입의 경우 명시된 값들만 사용하세요
+3. JOIN 조건에는 올바른 외래키 관계를 사용하세요
+4. SELECT 문만 생성하고 추가 설명은 포함하지 마세요
+5. 쿼리는 세미콜론(;)으로 끝나야 합니다
+
+응답 형식: 순수한 SQL 쿼리만 반환
+
+SQL:"""
+        else:
+            prompt = f"""{detailed_schema}
+
+사용자 요청: {user_request}
+
+위 스키마 정보를 바탕으로 SQL 쿼리를 생성해주세요.
 
 규칙:
-1. SELECT 문만 생성
-2. 정확한 테이블명과 컬럼명 사용
-3. 적절한 JOIN 조건 포함
-4. 필요한 WHERE 조건 추가
+1. 정확한 컬럼명 사용
+2. ENUM 값 확인
+3. 올바른 JOIN 조건
+4. SELECT문만 생성
+5. 세미콜론으로 종료
 
-SQL 쿼리:"""
+SQL:"""
 
         response = self.call_llm(prompt, stage="query_gen")
         if not response:
+            print("❌ LLM 쿼리 생성 실패")
+            return None
+
+        # SQL 쿼리 추출
+        sql_query = self.extract_sql_from_response(response)
+        if not sql_query:
+            print("❌ SQL 추출 실패")
+            return None
+
+        print(f"\n📝 추출된 SQL: {sql_query}")
+
+        # 쿼리 검증
+        print("\n🔍 생성된 SQL 쿼리 검증 중...")
+        is_valid, errors = self.validate_sql_query(sql_query)
+
+        if not is_valid:
+            print("❌ SQL 쿼리 검증 실패:")
+            for error in errors:
+                print(f"  - {error}")
+            
+            # 더 상세한 오류 정보로 재시도
+            error_details = self._analyze_query_errors(sql_query, errors)
+            retry_sql = self._retry_query_generation(user_request, detailed_schema, error_details)
+            
+            if retry_sql:
+                return retry_sql
+            else:
+                print("❌ 재시도도 실패")
+                return None
+        else:
+            print("✅ SQL 쿼리 검증 성공")
+            return sql_query
+    
+    def _generate_detailed_schema_info(self, tables: List[str], columns: Dict[str, List[str]]) -> str:
+        """상세한 스키마 정보 생성"""
+        schema_parts = ["=== 정확한 데이터베이스 스키마 정보 ===\n"]
+        
+        for table in tables:
+            if table not in self.tables_info:
+                continue
+                
+            # 테이블 설명 추가
+            table_schema = self.table_schemas.get(table)
+            if table_schema:
+                schema_parts.append(f"📋 테이블: {table}")
+                schema_parts.append(f"   설명: {table_schema.comment}")
+            else:
+                schema_parts.append(f"📋 테이블: {table}")
+            
+            schema_parts.append("   컬럼:")
+            
+            # 선택된 컬럼들의 상세 정보
+            selected_columns = columns.get(table, [])
+            for col_info in self.tables_info[table]['columns']:
+                col_name = col_info[0]
+                
+                # 선택된 컬럼만 표시하거나, 선택된 컬럼이 없으면 모든 컬럼 표시
+                if selected_columns and col_name not in selected_columns:
+                    continue
+                
+                col_type = col_info[1]
+                null_allowed = col_info[2] if len(col_info) > 2 else "YES"
+                col_key = col_info[3] if len(col_info) > 3 else ""
+                col_default = col_info[4] if len(col_info) > 4 else ""
+                col_extra = col_info[5] if len(col_info) > 5 else ""
+                
+                # 컬럼 상세 정보 생성
+                col_detail = f"     - {col_name}: {col_type}"
+                
+                if col_key == "PRI":
+                    col_detail += " (Primary Key)"
+                elif col_key == "MUL":
+                    col_detail += " (Foreign Key)"
+                
+                if null_allowed == "NO":
+                    col_detail += " NOT NULL"
+                
+                if col_extra == "auto_increment":
+                    col_detail += " AUTO_INCREMENT"
+                
+                # ENUM 타입의 경우 가능한 값들 표시
+                if "enum" in col_type.lower():
+                    col_detail += f" 가능한 값: {col_type}"
+                
+                if col_default and col_default != "NULL":
+                    col_detail += f" DEFAULT {col_default}"
+                
+                schema_parts.append(col_detail)
+            
+            # 외래키 관계 정보 추가
+            if table_schema and table_schema.foreign_keys:
+                schema_parts.append("   외래키 관계:")
+                for fk in table_schema.foreign_keys:
+                    schema_parts.append(f"     - {fk['from_column']} → {fk['to_table']}.{fk['to_column']}")
+            
+            schema_parts.append("")  # 테이블 간 구분
+        
+        # 중요 주의사항 추가
+        schema_parts.extend([
+            "⚠️ 중요 주의사항:",
+            "- 위에 명시된 정확한 컬럼명만 사용하세요",
+            "- ENUM 타입은 명시된 값만 사용 가능합니다",
+            "- 존재하지 않는 컬럼이나 값을 사용하지 마세요",
+            "- JOIN 시 올바른 외래키 관계를 사용하세요",
+            ""
+        ])
+        
+        return "\n".join(schema_parts)
+    
+    def _analyze_query_errors(self, sql_query: str, errors: List[str]) -> str:
+        """쿼리 오류 분석"""
+        error_analysis = ["쿼리 오류 분석:"]
+        
+        for error in errors:
+            if "존재하지 않는" in error:
+                error_analysis.append(f"- {error}")
+                if "컬럼" in error:
+                    error_analysis.append("  → 스키마에 명시된 정확한 컬럼명을 사용하세요")
+                elif "테이블" in error:
+                    error_analysis.append("  → 제공된 테이블명만 사용하세요")
+            elif "JOIN" in error:
+                error_analysis.append(f"- {error}")
+                error_analysis.append("  → 외래키 관계를 확인하고 올바른 조인 조건을 사용하세요")
+            else:
+                error_analysis.append(f"- {error}")
+        
+        return "\n".join(error_analysis)
+    
+    def _retry_query_generation(self, user_request: str, schema_info: str, error_details: str) -> Optional[str]:
+        """오류 정보를 바탕으로 쿼리 재생성"""
+        retry_prompt = f"""{schema_info}
+
+사용자 요청: {user_request}
+
+이전 시도에서 다음 오류가 발생했습니다:
+{error_details}
+
+위 오류를 수정하여 올바른 SQL 쿼리를 생성해주세요.
+스키마 정보를 정확히 확인하고 존재하는 컬럼과 값만 사용하세요.
+
+수정된 SQL 쿼리만 반환하세요:"""
+
+        print("\n🔄 쿼리 재생성 시도 중...")
+        retry_response = self.call_llm(retry_prompt, stage="query_gen")
+        
+        if retry_response:
+            retry_sql = self.extract_sql_from_response(retry_response)
+            if retry_sql:
+                print(f"📝 재생성된 SQL: {retry_sql}")
+                
+                # 재검증
+                is_valid, new_errors = self.validate_sql_query(retry_sql)
+                if is_valid:
+                    print("✅ 수정된 쿼리 검증 성공")
+                    return retry_sql
+                else:
+                    print("❌ 수정된 쿼리도 검증 실패:")
+                    for error in new_errors:
+                        print(f"  - {error}")
+        
+        return None
+    
+    def extract_sql_from_response(self, response: str) -> Optional[str]:
+        """LLM 응답에서 SQL 쿼리 추출 (개선된 버전)"""
+        if not response:
             return None
         
-        # SQL 쿼리 추출
+        print("🔍 LLM 응답에서 SQL 추출 중...")
+        print(f"📄 원본 응답 (처음 200자): {response[:200]}...")
+        
+        # 1단계: 코드 블록에서 SQL 추출 시도
+        sql_query = self._extract_from_code_blocks(response)
+        if sql_query:
+            print("✅ 코드 블록에서 SQL 추출 성공")
+            return sql_query
+        
+        # 2단계: SELECT로 시작하는 라인 찾기
+        sql_query = self._extract_from_select_lines(response)
+        if sql_query:
+            print("✅ SELECT 라인에서 SQL 추출 성공")
+            return sql_query
+        
+        # 3단계: 정규식으로 SQL 패턴 찾기
+        sql_query = self._extract_with_regex(response)
+        if sql_query:
+            print("✅ 정규식으로 SQL 추출 성공")
+            return sql_query
+        
+        print("❌ SQL 추출 실패")
+        return None
+    
+    def _extract_from_code_blocks(self, response: str) -> Optional[str]:
+        """코드 블록(```sql)에서 SQL 추출"""
+        import re
+        
+        # ```sql ... ``` 패턴 찾기
+        sql_blocks = re.findall(r'```sql\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
+        if sql_blocks:
+            sql = sql_blocks[0].strip()
+            return self._clean_sql(sql)
+        
+        # ``` ... ``` (sql 태그 없음) 패턴 찾기
+        code_blocks = re.findall(r'```\s*(.*?)\s*```', response, re.DOTALL)
+        for block in code_blocks:
+            block = block.strip()
+            if block.upper().startswith('SELECT'):
+                return self._clean_sql(block)
+        
+        return None
+    
+    def _extract_from_select_lines(self, response: str) -> Optional[str]:
+        """SELECT로 시작하는 라인들에서 SQL 추출"""
         lines = response.split('\n')
         sql_lines = []
         in_sql = False
         
         for line in lines:
             line = line.strip()
+            
+            # SELECT로 시작하면 SQL 시작
             if line.upper().startswith('SELECT'):
                 in_sql = True
-            if in_sql:
-                sql_lines.append(line)
-                if line.endswith(';'):
+                sql_lines = [line]
+            elif in_sql:
+                # SQL이 시작된 후 계속 추가
+                if line and not line.startswith('#') and not line.startswith('//') and not line.startswith('--'):
+                    sql_lines.append(line)
+                    
+                    # 세미콜론으로 끝나면 종료
+                    if line.endswith(';'):
+                        break
+                elif not line:  # 빈 줄은 무시
+                    continue
+                else:  # 주석이나 설명이 나오면 SQL 종료
                     break
         
         if sql_lines:
-            sql_query = ' '.join(sql_lines)
-            if not sql_query.endswith(';'):
-                sql_query += ';'
-            return sql_query
+            sql = ' '.join(sql_lines)
+            return self._clean_sql(sql)
         
         return None
+    
+    def _extract_with_regex(self, response: str) -> Optional[str]:
+        """정규식으로 SQL 패턴 추출"""
+        import re
         
-        if response:
-            # SQL 쿼리 추출
-            lines = response.split('\n')
-            sql_lines = []
-            in_sql = False
-            
-            for line in lines:
-                line = line.strip()
-                if line.upper().startswith('SELECT'):
-                    in_sql = True
-                if in_sql:
-                    sql_lines.append(line)
-                    if line.endswith(';'):
-                        break
-            
-            if sql_lines:
-                sql_query = ' '.join(sql_lines)
-                if not sql_query.endswith(';'):
-                    sql_query += ';'
-                
-                # 쿼리 검증
-                print("\n🔍 생성된 SQL 쿼리 검증 중...")
-                is_valid, errors = self.validate_sql_query(sql_query)
-                
-                if not is_valid:
-                    print("❌ SQL 쿼리 검증 실패:")
-                    for error in errors:
-                        print(f"  - {error}")
-                    
-                    # 오류 정보를 포함하여 LLM에게 재시도 요청
-                    retry_prompt = f"""{enhanced_prompt}
-
-이전 시도에서 다음 오류가 발생했습니다:
-{chr(10).join(f'- {error}' for error in errors)}
-
-위 오류를 수정하여 올바른 SQL 쿼리를 생성해주세요.
-특히 테이블과 컬럼명을 정확하게 사용해야 합니다.
-
-SQL 쿼리:"""
-                    
-                    print("\n🔄 쿼리 재생성 시도 중...")
-                    response = self.call_llm(retry_prompt)
-                    
-                    if response:
-                        # 재시도 쿼리 추출
-                        lines = response.split('\n')
-                        sql_lines = []
-                        in_sql = False
-                        
-                        for line in lines:
-                            line = line.strip()
-                            if line.upper().startswith('SELECT'):
-                                in_sql = True
-                            if in_sql:
-                                sql_lines.append(line)
-                                if line.endswith(';'):
-                                    break
-                        
-                        if sql_lines:
-                            sql_query = ' '.join(sql_lines)
-                            if not sql_query.endswith(';'):
-                                sql_query += ';'
-                            
-                            # 재검증
-                            is_valid, errors = self.validate_sql_query(sql_query)
-                            if is_valid:
-                                print("✅ 수정된 쿼리 검증 성공")
-                                return sql_query
-                            else:
-                                print("❌ 수정된 쿼리도 검증 실패:")
-                                for error in errors:
-                                    print(f"  - {error}")
-                                return None
-                else:
-                    print("✅ SQL 쿼리 검증 성공")
-                return sql_query
+        # SELECT로 시작해서 세미콜론까지의 패턴
+        pattern = r'SELECT\s+.*?;'
+        matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            # 가장 긴 매치 선택 (더 완전한 쿼리일 가능성)
+            sql = max(matches, key=len)
+            return self._clean_sql(sql)
         
         return None
+    
+    def _clean_sql(self, sql: str) -> str:
+        """SQL 쿼리 정리"""
+        if not sql:
+            return ""
+        
+        # 불필요한 공백 제거
+        sql = ' '.join(sql.split())
+        
+        # 세미콜론 확인 및 추가
+        if not sql.endswith(';'):
+            sql += ';'
+        
+        # 한국어 설명이나 마크다운 제거
+        import re
+        
+        # 백틱 제거
+        sql = re.sub(r'```\w*', '', sql)
+        sql = re.sub(r'```', '', sql)
+        
+        # SQL 키워드 이후 한글 설명 제거 (예: "; 이 쿼리는..." 부분)
+        sql = re.sub(r';\s*[가-힣].*$', ';', sql)
+        
+        # "위 쿼리는", "이 쿼리는" 등으로 시작하는 설명 제거
+        sql = re.sub(r'\s+[위이]\s*쿼리는.*$', '', sql)
+        
+        return sql.strip()
     
     def extract_relevant_tables_with_llm(self, user_request: str) -> List[str]:
         """LLM을 활용한 지능적 테이블 추출"""
@@ -2165,8 +2559,10 @@ SQL 쿼리:"""
                     print("⚠️  기본 모드로 실행 (Neo4j 없이)")
                 
                 print("\n" + "=" * 60)
-                print("�� 대화형 SQL 쿼리 생성 모드")
+                print("💡 대화형 SQL 쿼리 생성 모드")
                 print("종료하려면 'quit' 또는 'exit'를 입력하세요")
+                print("컬럼 검색 테스트: 'test_columns'")
+                print("Neo4j 메타데이터 확인: 'check_metadata'")
                 print("=" * 60)
                 
                 # 대화형 루프
@@ -2178,6 +2574,17 @@ SQL 쿼리:"""
                             break
                         
                         if not user_input:
+                            continue
+                        
+                        # 테스트 명령어 처리
+                        if user_input.lower() == 'test_columns':
+                            print("\n🧪 컬럼 검색 기능 테스트")
+                            self.verify_column_search_improvement()
+                            continue
+                        
+                        if user_input.lower() == 'check_metadata':
+                            print("\n🔍 Neo4j 메타데이터 확인")
+                            self.test_neo4j_column_metadata()
                             continue
                         
                         # SQL 쿼리 생성 (하이브리드 모드 우선)
@@ -2231,11 +2638,239 @@ SQL 쿼리:"""
             print("💡 오류 상세:")
             print(traceback.format_exc())
             self.disconnect_from_database()
+    
+    def test_neo4j_column_metadata(self) -> None:
+        """Neo4j 컬럼 메타데이터 조회 테스트 (디버깅용)"""
+        if not self.neo4j_driver:
+            print("❌ Neo4j 연결이 필요합니다.")
+            return
+        
+        print("🧪 Neo4j 컬럼 메타데이터 테스트 중...")
+        
+        try:
+            with self.neo4j_driver.session() as session:
+                # 모든 테이블과 컬럼 조회
+                query = """
+                MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+                RETURN t.name as table_name, 
+                       c.name as column_name, 
+                       c.type as column_type,
+                       c.nullable as nullable,
+                       c.auto_increment as auto_increment
+                ORDER BY t.name, c.name
+                """
+                
+                result = session.run(query)
+                
+                current_table = None
+                for record in result:
+                    table_name = record['table_name']
+                    column_name = record['column_name']
+                    column_type = record['column_type']
+                    nullable = record.get('nullable', True)
+                    auto_increment = record.get('auto_increment', False)
+                    
+                    if current_table != table_name:
+                        current_table = table_name
+                        print(f"\n📋 테이블: {table_name}")
+                    
+                    col_info = f"  - {column_name} ({column_type})"
+                    if not nullable:
+                        col_info += " NOT NULL"
+                    if auto_increment:
+                        col_info += " AUTO_INCREMENT"
+                    print(col_info)
+                
+                # 테이블 수 카운트
+                table_count_query = "MATCH (t:Table) RETURN count(t) as table_count"
+                table_count = session.run(table_count_query).single()['table_count']
+                
+                # 컬럼 수 카운트
+                column_count_query = "MATCH (c:Column) RETURN count(c) as column_count"
+                column_count = session.run(column_count_query).single()['column_count']
+                
+                print(f"\n📊 총 테이블: {table_count}개, 총 컬럼: {column_count}개")
+                
+        except Exception as e:
+            print(f"❌ Neo4j 컬럼 메타데이터 테스트 실패: {e}")
+    
+    def verify_column_search_improvement(self, user_request: str = "사용자들의 주문 정보를 보여줘") -> None:
+        """개선된 컬럼 검색 기능 검증"""
+        print("🔍 개선된 컬럼 검색 기능 테스트 중...")
+        print(f"테스트 요청: {user_request}")
+        
+        # 1. 먼저 테이블 검색
+        relevant_tables = self.extract_relevant_tables(user_request)
+        print(f"검색된 테이블: {relevant_tables}")
+        
+        if not relevant_tables:
+            print("❌ 관련 테이블을 찾을 수 없어 테스트를 중단합니다.")
+            return
+        
+        # 2. 개선된 컬럼 검색 테스트
+        selected_columns = self.find_target_columns(user_request, relevant_tables)
+        
+        if selected_columns:
+            print("✅ 컬럼 검색 성공!")
+            for table, columns in selected_columns.items():
+                print(f"  📋 {table}: {', '.join(columns)}")
+        else:
+            print("❌ 컬럼 검색 실패")
+    
+    def get_column_metadata_summary(self) -> Dict[str, Dict]:
+        """전체 컬럼 메타데이터 요약 정보 반환"""
+        if not self.neo4j_driver:
+            return {}
+        
+        summary = {}
+        
+        try:
+            with self.neo4j_driver.session() as session:
+                query = """
+                MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+                RETURN t.name as table_name,
+                       collect({
+                           name: c.name,
+                           type: c.type,
+                           nullable: c.nullable,
+                           auto_increment: c.auto_increment
+                       }) as columns
+                ORDER BY t.name
+                """
+                
+                result = session.run(query)
+                
+                for record in result:
+                    table_name = record['table_name']
+                    columns = record['columns']
+                    
+                    summary[table_name] = {
+                        'column_count': len(columns),
+                        'columns': columns,
+                        'id_columns': [col['name'] for col in columns if col['name'].lower().endswith('_id') or col['name'].lower() == 'id'],
+                        'name_columns': [col['name'] for col in columns if 'name' in col['name'].lower()],
+                        'date_columns': [col['name'] for col in columns if 'date' in col['name'].lower() or 'created_at' in col['name'].lower() or 'updated_at' in col['name'].lower()]
+                    }
+                
+        except Exception as e:
+            print(f"❌ 컬럼 메타데이터 요약 생성 실패: {e}")
+        
+        return summary
 
 def main():
     """메인 함수"""
+    import sys
+    
     generator = HybridQueryGenerator()
+    
+    # 명령행 인수 확인
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == "test":
+            # 간단한 테스트 모드
+            print("🧪 간단한 테스트 모드")
+            test_query_generation(generator)
+            return
+        elif command == "demo":
+            # 데모 모드 - 몇 가지 예제 쿼리 테스트
+            print("🎬 데모 모드")
+            demo_queries(generator)
+            return
+    
+    # 기본 대화형 모드
     generator.run_interactive_mode()
+
+def test_query_generation(generator):
+    """쿼리 생성 테스트"""
+    try:
+        # 데이터베이스 연결
+        if not generator.connect_to_database():
+            return
+        
+        # 기본 초기화
+        generator.analyze_all_tables()
+        generator.extract_schema_from_ddl()
+        
+        # 간단한 테스트 요청
+        test_request = "활성 사용자들의 이름과 이메일을 보여주세요"
+        print(f"\n🔍 테스트 요청: {test_request}")
+        
+        # 테이블 검색
+        tables = ["users"]  # 간단한 테스트용
+        print(f"📋 사용할 테이블: {tables}")
+        
+        # 컬럼 검색 (폴백 모드 사용)
+        columns = generator._fallback_column_search(test_request, tables)
+        print(f"📋 선택된 컬럼: {columns}")
+        
+        # 쿼리 생성
+        if columns:
+            sql_query = generator.generate_final_query(test_request, tables, columns)
+            
+            if sql_query:
+                print(f"\n✅ 생성된 쿼리: {sql_query}")
+                
+                # 실행 테스트
+                results = generator.execute_query(sql_query)
+                if results:
+                    print(f"📊 결과: {len(results)}개 행")
+                    for i, row in enumerate(results[:3], 1):
+                        print(f"  {i}: {row}")
+            else:
+                print("❌ 쿼리 생성 실패")
+        
+    except Exception as e:
+        print(f"❌ 테스트 중 오류: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        generator.disconnect_from_database()
+
+def demo_queries(generator):
+    """데모 쿼리들"""
+    demo_requests = [
+        "활성 사용자의 수를 알려주세요",
+        "사용자별 주문 수를 보여주세요", 
+        "가장 비싼 상품 5개를 보여주세요"
+    ]
+    
+    try:
+        if not generator.connect_to_database():
+            return
+            
+        generator.analyze_all_tables()
+        generator.extract_schema_from_ddl()
+        
+        for i, request in enumerate(demo_requests, 1):
+            print(f"\n{'='*50}")
+            print(f"🎬 데모 {i}: {request}")
+            print('='*50)
+            
+            # 간소화된 테스트
+            if "사용자" in request:
+                tables = ["users"]
+                columns = {"users": ["user_id", "username", "email", "status"]}
+            elif "주문" in request:
+                tables = ["users", "orders"]
+                columns = {"users": ["user_id", "username"], "orders": ["order_id", "user_id"]}
+            elif "상품" in request:
+                tables = ["products"]
+                columns = {"products": ["product_id", "product_name", "price"]}
+            else:
+                continue
+                
+            sql_query = generator.generate_final_query(request, tables, columns)
+            
+            if sql_query:
+                print(f"✅ SQL: {sql_query}")
+            else:
+                print("❌ 쿼리 생성 실패")
+                
+    except Exception as e:
+        print(f"❌ 데모 중 오류: {e}")
+    finally:
+        generator.disconnect_from_database()
 
 if __name__ == "__main__":
     main()
