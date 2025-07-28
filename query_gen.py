@@ -278,6 +278,93 @@ Cypher Query:"""
             print(f"❌ SQL 쿼리 실행 실패: {e}")
             return None
     
+    def _create_chain(self):
+        """GraphCypherQAChain 생성"""
+        try:
+            print("🔄 GraphCypherQAChain 생성 중...")
+            
+            # 커스텀 프롬프트 생성
+            cypher_prompt = PromptTemplate(
+                template="""You are a Neo4j expert. Return ONLY a Cypher query without any explanation.
+
+IMPORTANT - READ CAREFULLY:
+1. Return ONLY the Cypher query, no explanations or comments
+2. The query MUST start with MATCH
+3. When looking for table columns, ALWAYS return c.name as column_name
+4. Do NOT filter for specific columns - return ALL columns of the table
+5. This Neo4j database contains metadata about an RDB schema:
+   - (:Table) nodes represent database tables
+   - (:Column) nodes represent table columns
+   - [:HAS_COLUMN] shows which columns belong to which tables
+   - [:REFERENCES] shows foreign key relationships
+
+Example valid responses:
+1. Get all columns of users table:
+   MATCH (t:Table {{name: 'users'}})-[:HAS_COLUMN]->(c:Column)
+   RETURN c.name as column_name
+
+2. Get all columns of orders table:
+   MATCH (t:Table {{name: 'orders'}})-[:HAS_COLUMN]->(c:Column)
+   RETURN c.name as column_name
+
+Schema: {schema}
+
+Question: {query}
+
+Return ONLY the Cypher query that gets ALL columns of the relevant table:""",
+                input_variables=["schema", "query"]
+            )
+            
+            # 체인 생성
+            self.chain = GraphCypherQAChain.from_llm(
+                llm=self.llm,
+                graph=self.graph,
+                verbose=True,
+                return_intermediate_steps=True,
+                allow_dangerous_requests=True,  # 보안 경고 허용
+                cypher_prompt=cypher_prompt
+            )
+            
+            print("✅ GraphCypherQAChain 생성 완료!")
+            
+        except Exception as e:
+            print(f"❌ 체인 생성 실패: {e}")
+            raise
+    
+    def _clean_cypher_query(self, response: str) -> str:
+        """LLM 응답에서 순수한 Cypher 쿼리만 추출"""
+        import re
+        
+        # 설명이나 주석 제거
+        lines = response.strip().split('\n')
+        query_lines = []
+        for line in lines:
+            line = line.strip()
+            # 주석이나 설명 라인 무시
+            if line.startswith(('/*', '--', '//', '#', 'This', 'Note', 'Here')):
+                continue
+            # 빈 라인 무시
+            if not line:
+                continue
+            # 마크다운 코드 블록 표시 제거
+            if line.startswith('```') or line.endswith('```'):
+                continue
+            query_lines.append(line)
+        
+        # 쿼리 합치기
+        query = ' '.join(query_lines)
+        
+        # MATCH로 시작하는지 확인
+        if not query.upper().startswith('MATCH'):
+            # MATCH 키워드 찾기
+            match = re.search(r'MATCH\s+.*$', query, re.IGNORECASE | re.DOTALL)
+            if match:
+                query = match.group(0)
+            else:
+                raise ValueError("No valid Cypher query found (must start with MATCH)")
+        
+        return query
+    
     def generate_query(self, user_request: str) -> Optional[str]:
         """사용자 요청에 따른 쿼리 생성"""
         try:
@@ -289,6 +376,14 @@ Cypher Query:"""
             # 결과 출력
             if 'intermediate_steps' in result:
                 cypher_query = result['intermediate_steps'][0]['query']
+                
+                # Cypher 쿼리 정리
+                try:
+                    cypher_query = self._clean_cypher_query(cypher_query)
+                except ValueError as e:
+                    print(f"⚠️ 잘못된 Cypher 쿼리: {e}")
+                    return None
+                
                 print(f"\n📝 생성된 Cypher 쿼리:")
                 print(f"```cypher\n{cypher_query}\n```")
                 
@@ -321,44 +416,43 @@ Cypher Query:"""
     def _convert_to_sql(self, cypher_query: str, cypher_results: List[Dict]) -> Optional[str]:
         """Cypher 쿼리를 SQL로 변환"""
         try:
-            # LLM에게 변환 요청
-            prompt = f"""Convert this Cypher query to SQL:
-
-Cypher query:
-{cypher_query}
-
-The query was executed on this Neo4j schema:
-- Table nodes: (:Table {{name, comment}})
-- Column nodes: (:Column {{name, type, comment}})
-- Relationships: 
-  - (:Table)-[:HAS_COLUMN]->(:Column)
-  - (:Column)-[:REFERENCES]->(:Column)
-
-Available tables and columns:
-- users (user_id, username, email, full_name, created_at, status)
-- products (product_id, product_name, category_id, price, stock_quantity, description, status)
-- orders (order_id, user_id, order_date, total_amount, status, shipping_address)
-- order_items (order_item_id, order_id, product_id, quantity, unit_price, subtotal)
-- categories (category_id, category_name, parent_category_id, description)
-
-The query returned these columns: {list(cypher_results[0].keys()) if cypher_results else 'No results'}
-
-Generate a valid MariaDB SQL query that will return the same information.
-Use proper table and column names from the schema above.
-Add appropriate JOIN conditions if needed.
-
-SQL query:"""
-
-            # LLM 호출
-            if hasattr(self.llm, 'invoke'):
-                response = self.llm.invoke(prompt)
-                sql_query = response.content.strip() if hasattr(response, 'content') else str(response).strip()
-            else:
-                sql_query = self.llm(prompt)
+            # Cypher 결과에서 컬럼 정보 추출
+            if not cypher_results:
+                return None
             
-            # SQL 정리
-            if not sql_query.endswith(';'):
-                sql_query += ';'
+            # 결과에서 컬럼 이름들을 추출
+            columns = []
+            for result in cypher_results:
+                # column_name이 있는 경우 (기본 컬럼 조회)
+                if 'column_name' in result:
+                    columns.append(result['column_name'])
+                # name이 있는 경우 (대체 형식)
+                elif 'name' in result:
+                    columns.append(result['name'])
+            
+            # 중복 제거 및 정렬
+            columns = sorted(set(columns))
+            
+            if not columns:
+                print("⚠️ 컬럼 정보를 찾을 수 없습니다.")
+                return None
+            
+            # 테이블 이름 추출 (Cypher 쿼리에서)
+            import re
+            # 더 유연한 정규식 패턴으로 수정
+            table_match = re.search(r"Table\s*{.*?name:\s*'(\w+)'.*?}", cypher_query, re.IGNORECASE)
+            if not table_match:
+                # 대체 패턴 시도
+                table_match = re.search(r"Table.*?name:\s*'(\w+)'", cypher_query, re.IGNORECASE)
+            
+            if not table_match:
+                print("⚠️ 테이블 정보를 찾을 수 없습니다.")
+                return None
+            
+            table_name = table_match.group(1)
+            
+            # SQL SELECT 쿼리 생성
+            sql_query = f"SELECT {', '.join(columns)}\nFROM {table_name};"
             
             return sql_query
             
@@ -395,26 +489,6 @@ SQL query:"""
         # 더 많은 결과가 있다면 표시
         if len(results) > 10:
             print(f"\n   ... 그리고 {len(results) - 10}개의 결과가 더 있습니다.")
-    
-    def _create_chain(self):
-        """GraphCypherQAChain 생성"""
-        try:
-            print("🔄 GraphCypherQAChain 생성 중...")
-            
-            # 체인 생성
-            self.chain = GraphCypherQAChain.from_llm(
-                llm=self.llm,
-                graph=self.graph,
-                verbose=True,
-                return_intermediate_steps=True,
-                allow_dangerous_requests=True  # 보안 경고 허용
-            )
-            
-            print("✅ GraphCypherQAChain 생성 완료!")
-            
-        except Exception as e:
-            print(f"❌ 체인 생성 실패: {e}")
-            raise
     
     def run_interactive_mode(self):
         """대화형 모드 실행"""
