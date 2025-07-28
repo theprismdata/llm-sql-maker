@@ -1,12 +1,13 @@
-pymysql>=1.0.2
-requests>=2.25.1
-neo4j>=5.15.0
-anthropic>=0.3.0  # Claude API support (optional, for claude mode) 
-python-dotenv>=1.0.0  # .env file support
+# LangChain Neo4j 전용 패키지들
+langchain-neo4j==0.5.0
+langchain-core==0.3.68
+langchain-anthropic
+langchain-community==0.3.27  # 커뮤니티 패키지
+langchain-ollama
+python-dotenv>=1.0.0  # .env 파일 지원
 
-# 확장된 지식 그래프를 위한 추가 패키지
-sentence-transformers>=2.2.2  # 벡터 임베딩
-numpy>=1.24.0  # 수치 계산
-scikit-learn>=1.3.0  # 유사도 계산
-torch>=2.0.0  # PyTorch (sentence-transformers 의존성)
-transformers>=4.30.0  # Hugging Face transformers
+# LLM 및 데이터베이스 패키지들
+neo4j>=5.15.0
+anthropic>=0.3.0
+requests>=2.25.1  # OLLAMA API 호출용
+pymysql>=1.0.2  # MariaDB 연결용 (쿼리 실행)
