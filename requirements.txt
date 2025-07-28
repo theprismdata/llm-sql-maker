@@ -1,4 +1,13 @@
-pymysql>=1.0.2
-requests>=2.25.1
+# LangChain Neo4j 전용 패키지들
+langchain-neo4j==0.5.0
+langchain-core==0.3.68
+langchain-anthropic
+langchain-community==0.3.27  # 커뮤니티 패키지
+langchain-ollama
+python-dotenv>=1.0.0  # .env 파일 지원
+
+# LLM 및 데이터베이스 패키지들
 neo4j>=5.15.0
-anthropic>=0.3.0  # Claude API support (optional, for claude mode) 
+anthropic>=0.3.0
+requests>=2.25.1  # OLLAMA API 호출용
+pymysql>=1.0.2  # MariaDB 연결용 (쿼리 실행)
