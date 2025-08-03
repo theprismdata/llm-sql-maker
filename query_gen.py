@@ -40,7 +40,8 @@ class Neo4jQueryGenerator:
         
         # OLLAMA 설정
         self.ollama_url = "http://localhost:11434"
-        self.ollama_model = "codellama:7b"
+        # self.ollama_graph_query_model = "codellama:7b"
+        self.ollama_graph_query_model = "gemma3:12b"
         
         # LangChain 구성 요소
         self.graph = None
@@ -74,13 +75,13 @@ class Neo4jQueryGenerator:
             print("🔄 OLLAMA LLM 초기화 중...")
             self.llm = OllamaLLM(
                 base_url=self.ollama_url,
-                model=self.ollama_model,
+                model=self.ollama_graph_query_model,
                 temperature=0.1
             )
-            print(f"✅ OLLAMA LLM 초기화 성공! (모델: {self.ollama_model})")
+            print(f"✅ OLLAMA LLM 초기화 성공! (모델: {self.ollama_graph_query_model})")
             
             # GraphCypherQAChain 생성
-            self._create_chain()
+            self.get_GraphCypherQAChain()
             
         except Exception as e:
             print(f"❌ 초기화 실패: {e}")
@@ -209,44 +210,44 @@ class Neo4jQueryGenerator:
             print(f"❌ 스키마 초기화 실패: {e}")
             raise
     
-    def _get_cypher_prompt(self) -> PromptTemplate:
-        """Cypher 쿼리 생성을 위한 프롬프트 템플릿"""
-        template = """You are a Neo4j expert. Given the schema and question, generate a Cypher query to answer the question.
+#     def _get_cypher_prompt(self) -> PromptTemplate:
+#         """Cypher 쿼리 생성을 위한 프롬프트 템플릿"""
+#         template = """You are a Neo4j expert. Given the schema and question, generate a Cypher query to answer the question.
 
-Schema of the Neo4j database:
-Tables are represented as (:Table) nodes with properties:
-- name: table name (e.g., 'users', 'orders')
-- description: table description
+# Schema of the Neo4j database:
+# Tables are represented as (:Table) nodes with properties:
+# - name: table name (e.g., 'users', 'orders')
+# - description: table description
 
-Columns are represented as (:Column) nodes with properties:
-- name: column name (e.g., 'id', 'username', 'email')
+# Columns are represented as (:Column) nodes with properties:
+# - name: column name (e.g., 'id', 'username', 'email')
 
-Relationships:
-- (:Table)-[:HAS_COLUMN]->(:Column): table has this column
-- (:Column)-[:REFERENCES]->(:Column): foreign key relationship
+# Relationships:
+# - (:Table)-[:HAS_COLUMN]->(:Column): table has this column
+# - (:Column)-[:REFERENCES]->(:Column): foreign key relationship
 
-Example valid queries:
-1. Find all columns of users table:
-   MATCH (t:Table {name: 'users'})-[:HAS_COLUMN]->(c:Column)
-   RETURN t.name as table, c.name as column
+# Example valid queries:
+# 1. Find all columns of users table:
+#    MATCH (t:Table {name: 'users'})-[:HAS_COLUMN]->(c:Column)
+#    RETURN t.name as table, c.name as column
 
-2. Find related tables through foreign keys:
-   MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[:REFERENCES]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
-   RETURN t1.name as from_table, c1.name as from_column, t2.name as to_table, c2.name as to_column
+# 2. Find related tables through foreign keys:
+#    MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[:REFERENCES]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+#    RETURN t1.name as from_table, c1.name as from_column, t2.name as to_table, c2.name as to_column
 
-Question: {query}
+# Question: {query}
 
-Generate a Cypher query that answers this question.
-Use only the node labels, properties, and relationship types mentioned above.
-The query should return meaningful data that answers the question.
-Return column names with aliases for clarity.
+# Generate a Cypher query that answers this question.
+# Use only the node labels, properties, and relationship types mentioned above.
+# The query should return meaningful data that answers the question.
+# Return column names with aliases for clarity.
 
-Cypher Query:"""
+# Cypher Query:"""
         
-        return PromptTemplate(
-            template=template,
-            input_variables=["query"]
-        )
+#         return PromptTemplate(
+#             template=template,
+#             input_variables=["query"]
+#         )
     
     def _execute_sql(self, sql_query: str) -> Optional[List[Dict]]:
         """SQL 쿼리 실행"""
@@ -278,7 +279,7 @@ Cypher Query:"""
             print(f"❌ SQL 쿼리 실행 실패: {e}")
             return None
     
-    def _create_chain(self):
+    def get_GraphCypherQAChain(self):
         """GraphCypherQAChain 생성"""
         try:
             print("🔄 GraphCypherQAChain 생성 중...")
@@ -494,7 +495,7 @@ Return ONLY the Cypher query that gets ALL columns of the relevant table:""",
         """대화형 모드 실행"""
         print("=" * 70)
         print("🚀 LangChain Neo4j SQL 쿼리 생성기")
-        print(f"💡 OLLAMA 모델: {self.ollama_model}")
+        print(f"💡 OLLAMA 모델: {self.ollama_graph_query_model}")
         print("=" * 70)
         
         print("\n💡 대화형 모드")
