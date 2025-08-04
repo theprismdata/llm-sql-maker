@@ -148,11 +148,19 @@ class DataEmbedder:
                 for col in columns_info:
                     is_pk = col['COLUMN_KEY'] == 'PRI'
                     
+                    # enum 타입 처리
+                    column_type = col['COLUMN_TYPE']
+                    if column_type.startswith('enum('):
+                        # enum 값들을 문자열로 변환
+                        enum_values = column_type.replace('enum(', '').replace(')', '').replace("'", '').split(',')
+                        enum_values = [v.strip() for v in enum_values]
+                        column_type = 'enum(' + ','.join(enum_values) + ')'
+                    
                     self.graph.query(f"""
                     MATCH (t:Table {{name: '{table_name}'}})
                     CREATE (c:Column {{
                         name: '{col['COLUMN_NAME']}',
-                        type: '{col['COLUMN_TYPE']}',
+                        type: '{column_type}',
                         comment: '{col['COLUMN_COMMENT']}',
                         is_pk: {str(is_pk).lower()}
                     }})
@@ -206,10 +214,9 @@ class DataEmbedder:
                     props = []
                     for key, value in row.items():
                         if value is not None:
-                            if isinstance(value, str):
-                                props.append(f"{key}: '{str(value).replace(chr(39), chr(92)+chr(39))}'")
-                            else:
-                                props.append(f"{key}: {value}")
+                            # 모든 값을 문자열로 처리 (enum 포함)
+                            value_str = str(value).replace(chr(39), chr(92)+chr(39))
+                            props.append(f"{key}: '{value_str}'")
                     
                     props_str = ", ".join(props)
                     node_label = table_name.capitalize()
