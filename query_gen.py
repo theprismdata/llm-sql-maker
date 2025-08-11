@@ -16,6 +16,7 @@ from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 
 import pymysql
+from data_embedder import DataEmbedder
 
 class Neo4jQueryGenerator:
     def __init__(self):
@@ -48,6 +49,7 @@ class Neo4jQueryGenerator:
         self.llm = None
         self.chain = None
         self.mariadb_conn = None
+        self.data_embedder = None
         
         self._initialize_components()
     
@@ -68,9 +70,6 @@ class Neo4jQueryGenerator:
             self.mariadb_conn = pymysql.connect(**self.mariadb_config)
             print("✅ MariaDB 연결 성공!")
             
-            # 스키마 초기화
-            self._init_schema()
-            
             # OLLAMA LLM 초기화
             print("🔄 OLLAMA LLM 초기화 중...")
             self.llm = OllamaLLM(
@@ -82,6 +81,13 @@ class Neo4jQueryGenerator:
             
             # GraphCypherQAChain 생성
             self.get_GraphCypherQAChain()
+            
+            # 데이터 임베더 초기화
+            self.data_embedder = DataEmbedder(
+                neo4j_config=self.neo4j_config,
+                mariadb_config=self.mariadb_config,
+                model_name="BAAI/bge-m3"
+            )
             
         except Exception as e:
             print(f"❌ 초기화 실패: {e}")
@@ -493,14 +499,18 @@ Return ONLY the Cypher query that gets ALL columns of the relevant table:""",
     
     def run_interactive_mode(self):
         """대화형 모드 실행"""
-        print("=" * 70)
-        print("🚀 LangChain Neo4j SQL 쿼리 생성기")
-        print(f"💡 OLLAMA 모델: {self.ollama_graph_query_model}")
-        print("=" * 70)
-        
-        print("\n💡 대화형 모드")
-        print("종료하려면 'quit' 또는 'exit'를 입력하세요")
         print("=" * 50)
+        print("🚀 SQL 쿼리 생성기")
+        print(f"💡 모델: {self.ollama_graph_query_model}")
+        print("=" * 50)
+        
+        # 자동으로 데이터 임베딩 실행
+        print("🔄 데이터 임베딩 시작...")
+        self.data_embedder.full_hybrid_embedding()
+        self.data_embedder.get_embedding_stats()
+        
+        print("\n💡 대화형 모드 (종료: quit/exit)")
+        print("=" * 30)
         
         while True:
             try:
@@ -510,6 +520,11 @@ Return ONLY the Cypher query that gets ALL columns of the relevant table:""",
                     break
                 
                 if not user_input:
+                    continue
+                
+                # 특별 명령어 처리
+                if user_input.lower() == 'stats':
+                    self.data_embedder.get_embedding_stats()
                     continue
                 
                 # 쿼리 생성 및 실행
@@ -528,6 +543,9 @@ Return ONLY the Cypher query that gets ALL columns of the relevant table:""",
         if self.mariadb_conn:
             self.mariadb_conn.close()
             print("🔌 MariaDB 연결 종료")
+        
+        if self.data_embedder:
+            self.data_embedder.close_connections()
         
         print("👋 LangChain Neo4j 쿼리 생성기를 종료합니다.")
 
